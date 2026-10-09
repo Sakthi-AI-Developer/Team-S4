@@ -119,7 +119,7 @@ git --version
 ### 1. Clone the Repository
 
 ```bash
-git clone YOUR_GITHUB_REPOSITORY_URL
+git clone https://github.com/Sakthi-AI-Developer/Team-S4.git
 cd YOUR_PROJECT_FOLDER
 ```
 
