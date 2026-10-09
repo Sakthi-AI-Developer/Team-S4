@@ -77,6 +77,12 @@ uvicorn main:app --reload
 
 The API is available at `http://127.0.0.1:8000`; interactive docs at `/docs`. Although the original request shorthand was `uvicorn main --reload`, Uvicorn's valid ASGI app notation requires `main:app`.
 
+## Deploy the API to Render
+
+The repository-root `render.yaml` defines a Python Web Service with its root directory set to `satellite-intelligence/backend`. Render installs that directory's `requirements.txt` and starts `main:app` on `0.0.0.0:$PORT`. It pins Python to 3.12.11, which is within the documented Python 3.11+ range and is supported by the backend's geospatial and machine-learning dependencies.
+
+Set `CORS_ORIGINS` in the Render service environment to the deployed frontend's origin (comma-separated if there is more than one). `SATELLITE_PROVIDER` defaults to `local`; Copernicus credentials are only needed when explicitly enabling live satellite access. The `/api/health` endpoint is configured as the Render health check.
+
 ## Start frontend
 
 ```powershell
