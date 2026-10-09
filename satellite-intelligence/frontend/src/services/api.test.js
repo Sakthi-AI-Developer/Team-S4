@@ -1,0 +1,50 @@
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { api, downloadResult, getDataset, getHealth, getResultImageUrl, getResults, runAllAnalysis, runChangeDetection, runLandcover, runNDBI, runNDVI, runNDWI, uploadBand } from './api';
+
+describe('API service', () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it('calls the backend health and dataset routes', async () => {
+    const get = vi.spyOn(api, 'get').mockResolvedValue({ data: { status: 'ok' } });
+    await getHealth();
+    await getDataset();
+    expect(get).toHaveBeenNthCalledWith(1, '/health');
+    expect(get).toHaveBeenNthCalledWith(2, '/dataset');
+  });
+
+  it('uses the actual analysis and results endpoints', async () => {
+    const post = vi.spyOn(api, 'post').mockResolvedValue({ data: {} });
+    const get = vi.spyOn(api, 'get').mockResolvedValue({ data: {} });
+    await runNDVI();
+    await runNDWI();
+    await runNDBI();
+    await runLandcover();
+    await runChangeDetection();
+    await runAllAnalysis();
+    await getResults();
+    await downloadResult('id-1', 'ndvi');
+    expect(post.mock.calls.map(([path]) => path)).toEqual([
+      '/analyze/ndvi',
+      '/analyze/ndwi',
+      '/analyze/ndbi',
+      '/analyze/landcover',
+      '/analyze/change',
+      '/analyze/all',
+    ]);
+    expect(get).toHaveBeenLastCalledWith('/results/id-1/download/ndvi', { responseType: 'blob' });
+  });
+
+  it('builds a URL for the requested result layer', () => {
+    expect(getResultImageUrl('123', 'ndvi')).toContain('/api/results/123/image/ndvi');
+  });
+
+  it('uploads GeoTIFF bands to the selected local dataset period', async () => {
+    const post = vi.spyOn(api, 'post').mockResolvedValue({ data: { success: true } });
+    const file = new File(['raster-data'], 'S2_B04.tif', { type: 'image/tiff' });
+    await uploadBand('current', file);
+    const [path, body, options] = post.mock.calls[0];
+    expect(path).toBe('/dataset/current/upload');
+    expect(body.get('file')).toBe(file);
+    expect(options.onUploadProgress).toBeUndefined();
+  });
+});

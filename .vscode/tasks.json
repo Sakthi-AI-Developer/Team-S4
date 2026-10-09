@@ -1,0 +1,112 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Build satellite-intelligence frontend",
+			"type": "shell",
+			"command": "cd \"satellite-intelligence\\frontend\" && npm run build",
+			"isBackground": false,
+			"problemMatcher": [
+				"$tsc"
+			]
+		},
+		{
+			"label": "Build frontend with prefix",
+			"type": "shell",
+			"command": "npm --prefix satellite-intelligence/frontend run build ; if ($?) { Write-Host 'BUILD_OK' } else { Write-Host 'BUILD_FAIL'; exit 1 }",
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Run backend tests",
+			"type": "shell",
+			"command": ".\\.venv\\Scripts\\python.exe -m pytest -q satellite-intelligence\\backend ; if ($?) { Write-Host 'PYTEST_OK' } else { Write-Host 'PYTEST_FAIL'; exit 1 }",
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Backend pytest from backend dir",
+			"type": "shell",
+			"command": "Set-Location 'satellite-intelligence\\backend'; ..\\.venv\\Scripts\\python.exe -m pytest -q ; if ($?) { Write-Host 'PYTEST_OK' } else { Write-Host 'PYTEST_FAIL'; exit 1 }",
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Backend pytest absolute path",
+			"type": "shell",
+			"command": "& 'E:\\project\\Hackathon Erode\\.venv\\Scripts\\python.exe' -m pytest -q 'satellite-intelligence\\backend' ; if ($?) { Write-Host 'PYTEST_OK' } else { Write-Host 'PYTEST_FAIL'; exit 1 }",
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Run backend tests in backend dir",
+			"type": "shell",
+			"command": "Set-Location 'satellite-intelligence\\backend'; & 'E:\\project\\Hackathon Erode\\.venv\\Scripts\\python.exe' -m pytest -q ; if ($?) { Write-Host 'PYTEST_OK' } else { Write-Host 'PYTEST_FAIL'; exit 1 }",
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Start backend API server",
+			"type": "shell",
+			"command": "Set-Location 'satellite-intelligence\\backend'; & 'E:\\project\\Hackathon Erode\\.venv\\Scripts\\python.exe' -m uvicorn main:app --host 127.0.0.1 --port 8000",
+			"isBackground": true,
+			"problemMatcher": []
+		},
+		{
+			"label": "Verify backend endpoints",
+			"type": "shell",
+			"command": "Invoke-RestMethod -Uri 'http://127.0.0.1:8000/api/health'; Write-Host '---'; Invoke-RestMethod -Uri 'http://127.0.0.1:8000/api/dataset'",
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Inspect dataset endpoint output",
+			"type": "shell",
+			"command": "(Invoke-RestMethod -Uri 'http://127.0.0.1:8000/api/dataset') | ConvertTo-Json -Depth 10",
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Start frontend dev server",
+			"type": "shell",
+			"command": "npm --prefix satellite-intelligence/frontend run dev -- --host 127.0.0.1 --port 4173",
+			"isBackground": true,
+			"problemMatcher": []
+		},
+		{
+			"label": "Stop old backend server",
+			"type": "shell",
+			"command": "$process = Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'python.exe' -and $_.CommandLine -match 'uvicorn main:app --host 127.0.0.1 --port 8000' } ; if ($process) { Stop-Process -Id $process.ProcessId -Force; Write-Host 'STOPPED' } else { Write-Host 'NO_PROCESS' }",
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Restart backend API server",
+			"type": "shell",
+			"command": "Set-Location 'satellite-intelligence\\backend'; & 'E:\\project\\Hackathon Erode\\.venv\\Scripts\\python.exe' -m uvicorn main:app --host 127.0.0.1 --port 8000",
+			"isBackground": true,
+			"problemMatcher": []
+		},
+		{
+			"label": "Check pytest pythonpath support",
+			"type": "shell",
+			"command": "& 'E:\\project\\Hackathon Erode\\.venv\\Scripts\\python.exe' -m pytest --help | Select-String -Pattern 'pythonpath'",
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Verify pytest works from repo root",
+			"type": "shell",
+			"command": "& 'E:\\project\\Hackathon Erode\\.venv\\Scripts\\python.exe' -m pytest -q 'satellite-intelligence\\backend' ; if ($?) { Write-Host 'ROOT_PYTEST_OK' } else { Write-Host 'ROOT_PYTEST_FAIL'; exit 1 }",
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Compile backend and build frontend",
+			"type": "shell",
+			"command": "& 'E:\\project\\Hackathon Erode\\.venv\\Scripts\\python.exe' -m compileall 'satellite-intelligence\\backend'; npm --prefix 'satellite-intelligence/frontend' run build ; if ($?) { Write-Host 'VALIDATION_OK' } else { Write-Host 'VALIDATION_FAIL'; exit 1 }",
+			"isBackground": false,
+			"problemMatcher": []
+		}
+	]
+}
