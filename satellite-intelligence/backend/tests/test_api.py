@@ -32,6 +32,26 @@ def test_api_health():
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
 
+def test_production_frontend_cors_preflight():
+    origin = "https://team-s4-ten.vercel.app"
+    response = client.options(
+        "/api/health",
+        headers={
+            "Origin": origin,
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Headers": "accept",
+        },
+    )
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == origin
+
+
+def test_production_frontend_cors_health_request():
+    origin = "https://team-s4-ten.vercel.app"
+    response = client.get("/api/health", headers={"Origin": origin})
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == origin
+
 
 def test_dataset_endpoint_reports_empty_current_data(tmp_path, monkeypatch):
     configure_roots(tmp_path, monkeypatch)

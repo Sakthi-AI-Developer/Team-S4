@@ -20,6 +20,18 @@ class Settings:
 
 
 BACKEND_DIR = Path(__file__).resolve().parent
+PRODUCTION_FRONTEND_ORIGIN = "https://team-s4-ten.vercel.app"
+configured_cors_origins = [
+    origin.strip()
+    for origin in os.getenv(
+        "CORS_ORIGINS",
+        "http://localhost:5173,http://127.0.0.1:5173,http://localhost:4173,http://127.0.0.1:4173",
+    ).split(",")
+    if origin.strip()
+]
+if PRODUCTION_FRONTEND_ORIGIN not in configured_cors_origins:
+    configured_cors_origins.append(PRODUCTION_FRONTEND_ORIGIN)
+
 settings = Settings(
     data_dir=Path(os.getenv("DATA_DIR", BACKEND_DIR / "data")).expanduser().resolve(),
     output_dir=Path(
@@ -27,14 +39,7 @@ settings = Settings(
     ).expanduser().resolve(),
     api_host=os.getenv("API_HOST", "127.0.0.1"),
     api_port=int(os.getenv("API_PORT", "8000")),
-    cors_origins=[
-        origin.strip()
-        for origin in os.getenv(
-            "CORS_ORIGINS",
-            "http://localhost:5173,http://127.0.0.1:5173,http://localhost:4173,http://127.0.0.1:4173",
-        ).split(",")
-        if origin.strip()
-    ],
+    cors_origins=configured_cors_origins,
     satellite_provider=os.getenv("SATELLITE_PROVIDER", "local").strip().lower() or "local",
     copernicus_client_id=os.getenv("COPERNICUS_CLIENT_ID") or None,
     copernicus_client_secret=os.getenv("COPERNICUS_CLIENT_SECRET") or None,
