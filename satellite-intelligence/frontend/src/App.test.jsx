@@ -58,6 +58,7 @@ describe('dashboard', () => {
   it('renders real backend status and the empty-dataset instructions', async () => {
     render(<App />);
     await waitFor(() => expect(screen.getAllByText('System Online').length).toBeGreaterThan(0));
+    expect(screen.queryByText(/Backend is unavailable|health check failed/)).not.toBeInTheDocument();
     expect(screen.getAllByText('No satellite dataset available.').length).toBeGreaterThan(0);
     expect(screen.getAllByText(/backend\/data\/current\//).length).toBeGreaterThan(0);
     expect(screen.getByTestId('map')).toBeInTheDocument();
@@ -68,7 +69,14 @@ describe('dashboard', () => {
     service.getDataset.mockRejectedValue(new Error('offline'));
     render(<App />);
     expect((await screen.findAllByText('Backend Offline')).length).toBeGreaterThan(0);
-    expect(screen.getAllByText(/Start the FastAPI server/).length).toBeGreaterThan(0);
+    expect(screen.getByText(/Check the configured API URL/)).toBeInTheDocument();
+  });
+
+  it('reports HTTP health failures separately from connection failures', async () => {
+    service.getHealth.mockRejectedValue({ response: { status: 503 } });
+    service.getDataset.mockRejectedValue(new Error('offline'));
+    render(<App />);
+    expect(await screen.findByText('Backend health check failed with HTTP 503.')).toBeInTheDocument();
   });
 
   it('disables duplicate complete-analysis requests during loading', async () => {

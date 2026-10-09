@@ -8,3 +8,5 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.11
+      - key: CORS_ORIGINS
+        value: https://team-s4-ten.vercel.app

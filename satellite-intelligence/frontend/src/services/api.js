@@ -1,11 +1,23 @@
 import axios from 'axios';
 
-export const apiRootUrl = (import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000').replace(/\/+$/, '');
+export function normalizeApiRootUrl(value) {
+  return value?.trim().replace(/\/+$/, '').replace(/\/api$/i, '') || '';
+}
+
+const configuredApiRootUrl = normalizeApiRootUrl(import.meta.env.VITE_API_URL);
+export const apiRootUrl = configuredApiRootUrl || (import.meta.env.DEV ? 'http://127.0.0.1:8000' : '');
 export const apiBaseUrl = `${apiRootUrl}/api`;
 export const api = axios.create({ baseURL: apiBaseUrl, timeout: 120000 });
 
 export async function getHealth() {
-  return (await api.get('/health')).data;
+  if (!apiRootUrl) {
+    throw new Error('VITE_API_URL is required for production builds.');
+  }
+  const { data } = await api.get('/health');
+  if (data?.status !== 'ok' || data?.service !== 'satellite-intelligence-api') {
+    throw new Error('The API health endpoint returned an unexpected response.');
+  }
+  return data;
 }
 
 export async function getDataset() {

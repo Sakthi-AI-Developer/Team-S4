@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { downloadSatellite, getDataset, getGeoAIHistory, getGeoAIModelEvaluation, getGeoAIRiskIndicators, getGeoAIStatus, getHealth, getResults, getResult, getSatelliteStatus, runAllAnalysis, runChangeDetection, runGeoAILandCoverTransitions, runGeoAISpatialAnalysis, runGeoAIVegetationForecast, runLandcover, runNDBI, runNDVI, runNDWI, searchSatellite, uploadBand } from './services/api';
+import { apiRootUrl, downloadSatellite, getDataset, getGeoAIHistory, getGeoAIModelEvaluation, getGeoAIRiskIndicators, getGeoAIStatus, getHealth, getResults, getResult, getSatelliteStatus, runAllAnalysis, runChangeDetection, runGeoAILandCoverTransitions, runGeoAISpatialAnalysis, runGeoAIVegetationForecast, runLandcover, runNDBI, runNDVI, runNDWI, searchSatellite, uploadBand } from './services/api';
 import AnalysisPanel from './components/AnalysisPanel';
 import ChangeChart from './components/ChangeChart';
 import DatasetSelector from './components/DatasetSelector';
@@ -45,8 +45,17 @@ function friendlyError(error) {
   return typeof detail === 'string' ? detail : 'Unable to process the selected dataset.';
 }
 
+function healthErrorMessage(error) {
+  if (error.response) return `Backend health check failed with HTTP ${error.response.status}.`;
+  if (error.code === 'ECONNABORTED') return 'Backend health check timed out. Check the API URL and try again.';
+  if (!apiRootUrl) return 'Production API URL is not configured. Set VITE_API_URL and rebuild the frontend.';
+  if (error.message?.includes('unexpected response')) return 'Backend health check returned an invalid response.';
+  return 'Backend is unavailable. Check the configured API URL and network connection.';
+}
+
 function App() {
   const [backendStatus, setBackendStatus] = useState('checking');
+  const [backendError, setBackendError] = useState('');
   const [dataset, setDataset] = useState(null);
   const [datasetLoading, setDatasetLoading] = useState(true);
   const [uploadingPeriod, setUploadingPeriod] = useState('');
@@ -130,10 +139,10 @@ function App() {
     async function initialize() {
       const healthCheck = getHealth()
         .then(() => { if (mounted) setBackendStatus('online'); })
-        .catch(() => {
+        .catch((error) => {
           if (mounted) {
             setBackendStatus('offline');
-            setError('Backend is unavailable. Start the FastAPI server to enable satellite analysis.');
+            setBackendError(healthErrorMessage(error));
           }
         });
       const datasetCheck = refreshDataset();
@@ -387,8 +396,8 @@ function App() {
           </div>
         </section>
 
-        {backendStatus === 'offline' && <ErrorMessage message="Backend is unavailable. Start the FastAPI server to enable satellite analysis." />}
-        {error && <ErrorMessage message={error} onDismiss={() => setError('')} />}
+        {backendStatus === 'offline' && <ErrorMessage message={backendError} />}
+        {error && backendStatus !== 'offline' && <ErrorMessage message={error} onDismiss={() => setError('')} />}
         {notice && <div className="alert info" role="status"><span>i</span><p>{notice}</p><button onClick={() => setNotice('')} aria-label="Dismiss notice">×</button></div>}
 
         <section id="dataset">

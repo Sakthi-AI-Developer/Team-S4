@@ -83,7 +83,7 @@ The repository-root `render.yaml` defines a Python Web Service that builds from 
 
 For an existing Render service configured in the Dashboard, set **Root Directory** to blank (the repository root), **Build Command** to `pip install -r satellite-intelligence/backend/requirements.txt`, and **Start Command** to `uvicorn --app-dir satellite-intelligence/backend main:app --host 0.0.0.0 --port $PORT`. Dashboard settings can override a checked-in Blueprint, so update these fields there if the service still runs `pip install -r requirements.txt` from the root. The backend dependencies have also been installed and exercised locally with Python 3.14.3, but this deployment stays on its existing Python 3.12.11 pin.
 
-Set `CORS_ORIGINS` in the Render service environment to the deployed frontend's origin (comma-separated if there is more than one). `SATELLITE_PROVIDER` defaults to `local`; Copernicus credentials are only needed when explicitly enabling live satellite access. The `/api/health` endpoint is configured as the Render health check.
+`render.yaml` sets the Render `CORS_ORIGINS` value to `https://team-s4-ten.vercel.app`, the deployed frontend origin. If the Render Dashboard overrides Blueprint environment values, set that exact origin there as well (no trailing slash). `SATELLITE_PROVIDER` defaults to `local`; Copernicus credentials are only needed when explicitly enabling live satellite access. The `/api/health` endpoint is configured as the Render health check.
 
 ## Start frontend
 
@@ -93,7 +93,7 @@ npm install
 npm run dev
 ```
 
-Open the Vite URL (normally `http://127.0.0.1:5173`). Set `VITE_API_URL` to override the default API origin `http://127.0.0.1:8000`. Raster rendering is georeferenced from the output transform and CRS. OpenStreetMap tiles provide optional web basemap context; the local raster analysis itself does not depend on satellite APIs. Without internet access, the calculated overlay and local analysis remain available, but the optional basemap may not load.
+Open the Vite URL (normally `http://127.0.0.1:5173`). Set `VITE_API_URL` to override the default development API origin `http://127.0.0.1:8000`. The production build reads `frontend/.env.production`; the deployed Vercel project can also define `VITE_API_URL` as a build-time environment variable. The current production value is `https://satellite-vision-dashboard.onrender.com`. Changing a Vite variable requires rebuilding and redeploying the frontend. The API client accepts either the backend origin or that origin with a trailing `/api`, and adds exactly one `/api` path. Raster rendering is georeferenced from the output transform and CRS. OpenStreetMap tiles provide optional web basemap context; the local raster analysis itself does not depend on satellite APIs. Without internet access, the calculated overlay and local analysis remain available, but the optional basemap may not load.
 
 ## Run tests
 

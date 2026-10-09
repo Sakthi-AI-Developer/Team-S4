@@ -1,15 +1,43 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { api, downloadResult, getDataset, getHealth, getResultImageUrl, getResults, runAllAnalysis, runChangeDetection, runLandcover, runNDBI, runNDVI, runNDWI, uploadBand } from './api';
+import { api, apiBaseUrl, downloadResult, getDataset, getHealth, getResultImageUrl, getResults, normalizeApiRootUrl, runAllAnalysis, runChangeDetection, runLandcover, runNDBI, runNDVI, runNDWI, uploadBand } from './api';
 
 describe('API service', () => {
   afterEach(() => vi.restoreAllMocks());
 
   it('calls the backend health and dataset routes', async () => {
-    const get = vi.spyOn(api, 'get').mockResolvedValue({ data: { status: 'ok' } });
-    await getHealth();
+    const get = vi.spyOn(api, 'get').mockResolvedValue({
+      data: { status: 'ok', service: 'satellite-intelligence-api', provider: 'local', configured: false },
+    });
+    await expect(getHealth()).resolves.toMatchObject({ status: 'ok', service: 'satellite-intelligence-api' });
     await getDataset();
     expect(get).toHaveBeenNthCalledWith(1, '/health');
     expect(get).toHaveBeenNthCalledWith(2, '/dataset');
+  });
+
+  it('normalizes API origins with or without a trailing /api path', () => {
+    expect(normalizeApiRootUrl('https://api.example.test/')).toBe('https://api.example.test');
+    expect(normalizeApiRootUrl('https://api.example.test/api/')).toBe('https://api.example.test');
+    expect(apiBaseUrl).toMatch(/\/api$/);
+    expect(apiBaseUrl).not.toMatch(/\/api\/api$/);
+  });
+
+  it('rejects an invalid health response instead of marking the API online', async () => {
+    vi.spyOn(api, 'get').mockResolvedValue({ data: { status: 'degraded', service: 'satellite-intelligence-api' } });
+    await expect(getHealth()).rejects.toThrow('health endpoint returned an unexpected response');
+  });
+
+  it('rejects invalid JSON health payloads', async () => {
+    vi.spyOn(api, 'get').mockResolvedValue({ data: 'not JSON' });
+    await expect(getHealth()).rejects.toThrow('health endpoint returned an unexpected response');
+  });
+
+  it('preserves HTTP and timeout errors for the UI to report accurately', async () => {
+    const get = vi.spyOn(api, 'get');
+    get.mockRejectedValueOnce({ response: { status: 503 } });
+    await expect(getHealth()).rejects.toMatchObject({ response: { status: 503 } });
+
+    get.mockRejectedValueOnce({ code: 'ECONNABORTED' });
+    await expect(getHealth()).rejects.toMatchObject({ code: 'ECONNABORTED' });
   });
 
   it('uses the actual analysis and results endpoints', async () => {
