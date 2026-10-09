@@ -79,7 +79,9 @@ The API is available at `http://127.0.0.1:8000`; interactive docs at `/docs`. Al
 
 ## Deploy the API to Render
 
-The repository-root `render.yaml` defines a Python Web Service with its root directory set to `satellite-intelligence/backend`. Render installs that directory's `requirements.txt` and starts `main:app` on `0.0.0.0:$PORT`. It pins Python to 3.12.11, which is within the documented Python 3.11+ range and is supported by the backend's geospatial and machine-learning dependencies.
+The repository-root `render.yaml` defines a Python Web Service that builds from the repository root and explicitly targets the backend in `satellite-intelligence/backend`. It installs `satellite-intelligence/backend/requirements.txt` and starts `main:app` with that backend directory on Uvicorn's import path, listening on `0.0.0.0:$PORT`. Python remains pinned to 3.12.11 for the Render service.
+
+For an existing Render service configured in the Dashboard, set **Root Directory** to blank (the repository root), **Build Command** to `pip install -r satellite-intelligence/backend/requirements.txt`, and **Start Command** to `uvicorn --app-dir satellite-intelligence/backend main:app --host 0.0.0.0 --port $PORT`. Dashboard settings can override a checked-in Blueprint, so update these fields there if the service still runs `pip install -r requirements.txt` from the root. The backend dependencies have also been installed and exercised locally with Python 3.14.3, but this deployment stays on its existing Python 3.12.11 pin.
 
 Set `CORS_ORIGINS` in the Render service environment to the deployed frontend's origin (comma-separated if there is more than one). `SATELLITE_PROVIDER` defaults to `local`; Copernicus credentials are only needed when explicitly enabling live satellite access. The `/api/health` endpoint is configured as the Render health check.
 
