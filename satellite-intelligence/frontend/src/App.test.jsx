@@ -160,6 +160,7 @@ describe('dashboard', () => {
     render(<App />);
 
     await screen.findByText('active@example.test');
+    await waitFor(() => expect(onAuthStateChange).toEqual(expect.any(Function)));
     onAuthStateChange('SIGNED_OUT', null);
 
     expect(await screen.findByRole('heading', { name: 'Sign in to Satellite Vision' })).toBeInTheDocument();
