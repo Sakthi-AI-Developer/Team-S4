@@ -1,3 +1,5 @@
+import ImageryIngestionPanel from './ImageryIngestionPanel';
+
 const BAND_CODES = ['B02', 'B03', 'B04', 'B08', 'B11'];
 
 function Period({ period, title, dataset, uploading, onUpload }) {
@@ -37,7 +39,22 @@ function Period({ period, title, dataset, uploading, onUpload }) {
   );
 }
 
-export default function DatasetSelector({ dataset, loading, uploadingPeriod, onUpload, onRefresh }) {
+export default function DatasetSelector({
+  dataset,
+  loading,
+  uploadingPeriod,
+  onUpload,
+  onRefresh,
+  savedResults = [],
+  resultsLoading = false,
+  resultsError = '',
+  hasMoreResults = false,
+  loadingMoreResults = false,
+  onRefreshResults,
+  onLoadMoreResults,
+  onAnalysisCompleted,
+  requestedGisResult,
+}) {
   return (
     <section className="dataset-panel panel" aria-label="Dataset availability">
       <div className="panel-header">
@@ -60,6 +77,17 @@ export default function DatasetSelector({ dataset, loading, uploadingPeriod, onU
       {dataset?.current?.errors?.length > 0 && (
         <p className="dataset-warning">Some raster files could not be read. Check TIFF integrity and band filenames.</p>
       )}
+      <ImageryIngestionPanel
+        savedResults={savedResults}
+        resultsLoading={resultsLoading}
+        resultsError={resultsError}
+        hasMoreResults={hasMoreResults}
+        loadingMoreResults={loadingMoreResults}
+        onRefreshResults={onRefreshResults}
+        onLoadMoreResults={onLoadMoreResults}
+        onAnalysisCompleted={onAnalysisCompleted}
+        requestedGisResult={requestedGisResult}
+      />
     </section>
   );
 }

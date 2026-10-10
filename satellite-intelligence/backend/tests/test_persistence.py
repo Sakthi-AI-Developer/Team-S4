@@ -214,6 +214,121 @@ def test_analysis_history_query_bounds_pages_and_filters_owner(tmp_path):
     repository.close()
 
 
+def test_results_history_includes_status_and_safe_context_only_for_owner(tmp_path, monkeypatch):
+    repository = _repository(tmp_path)
+    manager = PersistenceManager(
+        replace(routes.settings, output_dir=tmp_path / "outputs"),
+        repository=repository,
+    )
+    monkeypatch.setattr(routes, "persistence_manager", manager)
+    previous_override = app.dependency_overrides.get(authentication.current_user)
+    app.dependency_overrides[authentication.current_user] = lambda: (
+        authentication.AuthenticatedUser("owner-a")
+    )
+
+    records = (
+        ("1" * 32, "ndvi", "owner-a", {"scene_id": "scene-1", "threshold": 0.3}),
+        ("2" * 32, "ndwi", "owner-a", {}),
+        ("3" * 32, "change_detection", "owner-a", {}),
+        ("4" * 32, "ndvi", "owner-b", {}),
+    )
+    jobs = {}
+    for analysis_id, analysis, owner_id, parameters in records:
+        job_id = f"job-{analysis_id}"
+        jobs[analysis_id] = job_id
+        repository.create_job(
+            analysis_id,
+            analysis,
+            parameters,
+            job_id,
+            owner_id=owner_id,
+        )
+    repository.complete_analysis(
+        "1" * 32,
+        jobs["1" * 32],
+        {
+            "id": "1" * 32,
+            "analysis": "NDVI",
+            "scene": {
+                "id": "scene-1",
+                "filename": r"C:\private\server\scene.tif",
+            },
+            "result": {
+                "bounds": [1, 2, 3, 4],
+                "width": 4,
+                "height": 3,
+                "nodata_value": -9999,
+                "statistics": {"mean": 0.42, "valid_pixels": 12},
+                "raster": {
+                    "crs": "EPSG:32610",
+                    "bounds": [1, 2, 3, 4],
+                    "artifact_name": "ndvi.tif",
+                    "nodata": -9999,
+                    "dtype": "float32",
+                },
+            },
+            "visualization_url": "https://private.example.test/token",
+        },
+        [],
+    )
+    repository.transition_job(jobs["3" * 32], "failed", "private error detail")
+    repository.complete_analysis(
+        "4" * 32,
+        jobs["4" * 32],
+        {"id": "4" * 32, "analysis": "NDVI"},
+        [],
+    )
+    try:
+        api_client = TestClient(app)
+        default_results = api_client.get("/api/results?limit=10")
+        first_page = api_client.get(
+            "/api/results?include_incomplete=true&limit=2"
+        )
+        second_page = api_client.get(
+            "/api/results?include_incomplete=true&limit=2&offset=2"
+        )
+        other_owner_record = api_client.get(
+            f"/api/analyses/{'4' * 32}"
+        )
+    finally:
+        if previous_override is None:
+            app.dependency_overrides.pop(authentication.current_user, None)
+        else:
+            app.dependency_overrides[authentication.current_user] = previous_override
+        repository.close()
+
+    assert default_results.status_code == 200
+    assert [item["id"] for item in default_results.json()["results"]] == ["1" * 32]
+    assert first_page.status_code == second_page.status_code == 200
+    assert first_page.json()["has_more"] is True
+    history_rows = first_page.json()["results"] + second_page.json()["results"]
+    assert {item["status"] for item in history_rows} == {"completed", "running", "failed"}
+    completed = next(item for item in history_rows if item["id"] == "1" * 32)
+    assert completed["history"]["statistics"] == {
+        "Summary": {"mean": 0.42, "valid_pixels": 12},
+    }
+    assert completed["history"]["spatial_metadata"] == {
+        "bounds_wgs84": [1, 2, 3, 4],
+        "width": 4,
+        "height": 3,
+        "nodata_value": -9999,
+        "crs": "EPSG:32610",
+        "bounds": [1, 2, 3, 4],
+        "nodata": -9999,
+        "dtype": "float32",
+    }
+    assert completed["history"]["parameters"] == {
+        "scene_id": "scene-1",
+        "threshold": 0.3,
+    }
+    assert completed["history"]["source_scenes"][0]["filename"] == "scene.tif"
+    serialized = first_page.text + second_page.text
+    assert "owner_id" not in serialized
+    assert "private.example.test" not in serialized
+    assert "private error detail" not in serialized
+    assert other_owner_record.status_code == 404
+
+
 def test_idempotency_replay_of_active_job_returns_conflict(tmp_path, monkeypatch):
     repository = _repository(tmp_path)
     manager = PersistenceManager(

@@ -1,6 +1,6 @@
 # Satellite Intelligence & Land Monitoring
 
-Satellite Vision is a local-first GeoTIFF analysis MVP for interpretable spectral indices, heuristic land-cover indicators, historical NDVI comparison, map overlays, and reports. It processes supplied/pre-downloaded data; it does not currently retrieve real satellite scenes. Normal analysis never substitutes sample data for user inputs. A separate deterministic synthetic demo is explicitly labelled, kept in memory, and has no real-world georeferencing.
+Satellite Vision is a GeoTIFF analysis MVP for interpretable spectral indices, heuristic land-cover indicators, historical NDVI comparison, map overlays, and reports. It processes user-supplied or pre-downloaded data; automatic catalog search and satellite-scene downloads are not implemented. Normal analysis never substitutes sample data for user inputs. A separate deterministic synthetic demo is explicitly labelled, kept in memory, and has no real-world georeferencing.
 
 ## Problem statement
 
@@ -17,13 +17,18 @@ The project addresses the hackathon challenge, “AI/ML based system for derivin
 - React dashboard with georeferenced map layers, statistics, charts, careful deterministic insights, and safe result downloads
 - FastAPI health and dataset status endpoints; useful empty-dataset state when imagery is absent
 - Per-analysis provenance from raster metadata, including explicit unknowns and quality warnings
+- Authenticated scene ingestion for GeoTIFF validation, metadata extraction, and bounded RGB/grayscale previews; original imagery remains unchanged
+- Imagery scene records use the existing analysis/job database and private artifact-storage workflow; local/demo mode is labelled local-only
 - Clearly isolated synthetic calculation demo; no fabricated observation date, location, or model score
+- Scene-bound NDVI, McFeeters NDWI, and neutral-label unsupervised K-means with bounded raster-window processing and private result artifacts
+- Advanced GIS workspace for saved scene previews and completed analysis results, with visibility, opacity, ordering, fit-to-layer, coordinate inspection, legends, and private raster downloads
+- Owner-scoped, paginated analysis history with actual persisted job status, compact provenance/statistics reports, CSV/JSON summaries, and browser print layout
 
 ### Evidence status
 
 | Status | Scope |
 |---|---|
-| Implemented and verified locally | Raster validation, NDVI/NDWI/NDBI, heuristic land-cover baseline, aligned NDVI change, synthetic demo, local API/UI tests, and frontend production build. |
+| Implemented and verified locally | Raster validation, NDVI/NDWI/NDBI, heuristic land-cover baseline, aligned NDVI change, synthetic demo, GeoTIFF scene ingestion/preview, scene-bound NDVI/McFeeters NDWI/K-means, local metadata and artifact persistence, ownership checks, local API/UI tests, and frontend production build. Imagery and scene-analysis fixtures are synthetic test rasters, not satellite observations. |
 | Implemented but not fully verified | Supabase Auth integration, PostgreSQL migrations/metadata, private Storage artifacts, owner-scoped cloud retrieval, and configured production deployment. Source and mock/local tests exist; live cloud credentials and a matching deployed build were unavailable. |
 | Planned or incomplete | Live satellite scene search/download, AOI clipping, automatic reprojection/resampling, cloud masking, trained/ground-truth-evaluated ML, and durable asynchronous workers. |
 
@@ -31,9 +36,55 @@ Passing software tests does not establish scientific accuracy or prove live depl
 
 ## Architecture
 
-`React dashboard → FastAPI → local pre-downloaded GeoTIFF data → raster processing → GeoTIFF / PNG / JSON outputs`
+`React dashboard → FastAPI → user-supplied GeoTIFF → bounded validation/preview → private cloud artifacts + PostgreSQL metadata (or explicit local-only mode)`
+
+`LocalDataProvider → pre-downloaded band GeoTIFFs → raster analysis → GeoTIFF / PNG / JSON outputs`
 
 `LocalDataProvider` is the operational data path. Provider interfaces and a synthetic/mock implementation exist, but configuring a live provider does not make satellite scene search or download operational. See the [evidence-based architecture and workflow diagrams](docs/final_submission/Satellite_Vision_Architecture.md).
+
+## Imagery ingestion and open data sources
+
+In the dashboard's **Local Dataset** section, upload one georeferenced `.tif`/`.tiff` scene to inspect it. The API enforces the configured upload/file limits and `MAX_IMAGERY_PIXELS` (default 200,000,000 pixels), requires a CRS and valid sampled preview pixels, and returns its source-derived date (when present), WGS84 extent, CRS, dimensions, resolution, and band descriptions. Multiband scenes with identifiable B04/B03/B02 descriptions get a band-labelled RGB preview; other multiband files use bands 1–3 with their semantics explicitly unverified; single-band files get a grayscale preview. The bounded display preview is reprojected onto an EPSG:4326 grid and includes its exact WGS84 bounds for map placement; the source GeoTIFF is retained unchanged. Cloud masking is not applied, and unknown metadata stays unknown.
+
+The ingestion endpoint accepts GeoTIFF only; it does not download products from a satellite catalog or accept Sentinel SAFE/JP2 archives directly. Convert/download the desired product as georeferenced GeoTIFF before upload. In deployment, imagery uses the existing private Supabase Storage bucket and owner-scoped artifact endpoints when the cloud persistence configuration is active. A no-cloud local/demo configuration is explicitly marked `local-only` and is not durable across ephemeral backend restarts.
+
+### Scene analysis
+
+Open a saved scene in the dashboard's **Inspect a GeoTIFF scene** panel, then choose **Analyze this scene**. The authenticated backend exposes `GET /api/imagery/analysis-types`, `POST /api/imagery/scenes/{scene_id}/analyses`, and `GET /api/imagery/analyses/{analysis_id}`. Scene and result lookups remain owner-scoped, and output downloads use the existing private artifact endpoint; no permanent public URL is created.
+
+- **NDVI** uses `(NIR - Red) / (NIR + Red)` and **McFeeters NDWI** uses `(Green - NIR) / (Green + NIR)`. For Sentinel-2-style inputs the metadata labels `B04`, `B08`, and `B03` are recognized as possible red, near-infrared, and green bands. Metadata labels are not independently verified. If a role is missing or ambiguous, select its source band explicitly. Per-band scale and offset are applied before calculation; nodata, non-finite values, and zero denominators are excluded.
+- Index GeoTIFFs preserve the source CRS, transform, dimensions, and nodata locations. Each result includes valid-pixel min/max/mean and an estimated median: histogram-based within [-1, 1] (maximum bin width 0.0004883), with a deterministic bounded sample used when the median lies outside that range. The NDVI legend is illustrative only and is not a universal biome- or sensor-independent classification; the NDWI is the green/NIR water-related formulation, not the Gao NIR/SWIR index.
+- **K-means** is a deterministic, standardized `MiniBatchKMeans` baseline over 2–16 explicitly selected feature bands, with 2–10 clusters and a bounded 50,000-pixel deterministic training sample. Pixel windows are processed in 256 × 256 blocks. Output labels remain `Class 1`, `Class 2`, and so on: clusters are spectral groups, not verified land-cover types or evidence of a trained/accurate semantic model.
+- Results are georeferenced GeoTIFFs plus a small EPSG:4326 preview, summary statistics/class proportions, and report metadata, stored through the existing analysis/job and artifact persistence flow. Analysis respects `MAX_IMAGERY_PIXELS`, raster/artifact size limits, and `MAX_ANALYSIS_SECONDS`. There is no database schema migration or new runtime dependency for this workflow.
+
+### Advanced GIS workspace
+
+Open **Map layers and scene information** below the imagery upload/analysis controls. Choose a saved scene to add its bounded RGB/grayscale preview, or choose a completed/saved analysis result to add its map preview without rerunning processing. The workspace uses the existing owner-scoped result and artifact APIs; preview requests and raster downloads stay authenticated, and no storage URL is exposed to the browser. Previously stored scene metadata without `preview.bounds_wgs84` is not overlaid using an approximate bounding box; re-ingest that source scene to create an accurately aligned preview.
+
+The React-Leaflet map supports pan/zoom, scale, selected-layer and visible-layer fitting, a neutral world-view reset, layer visibility, opacity, order, metadata/legend inspection, retrying a failed preview, and private source/result GeoTIFF downloads. Bounds use `[west, south, east, north]` in EPSG:4326 and are derived from the actual bounded preview grid; the source raster's CRS and dimensions remain separately identified. Clicking the map displays longitude then latitude in WGS84. Pixel-value sampling is not implemented. Map previews are for display and do not replace georeferenced raster downloads. Removing a layer only removes it from the current in-memory map; it does not delete the saved artifact.
+
+OpenStreetMap is the optional default basemap. The map retains visible raster overlays and controls if tiles fail, but OSM tiles require a network connection and must be used with the provider's [attribution and tile usage policy](https://operations.osmfoundation.org/policies/tiles/). No alternative tile provider or screenshot export is included; cross-origin tile licensing and canvas restrictions make a reliable map-image export inappropriate here. An exported PNG preview would not be a georeferenced raster.
+
+### Analysis history and reports
+
+The **History and reports** panel uses the existing paginated results workflow. `GET /api/results` continues to return completed results by default; the dashboard opts into `GET /api/results?include_incomplete=true` to display stored completed, running, and failed records. The query remains owner-scoped, and report details are fetched from the existing authenticated `GET /api/analyses/{analysis_id}` route only when a report is opened. Artifact manifests and downloads use the existing private, owner-authorized artifact routes.
+
+Filter history by persisted status or analysis name, open a report for recorded source identifiers/dates, analysis parameters, available raster metadata, statistics and metrics, and download available result files. Missing values remain explicitly unknown. Completed results can be sent to the GIS workspace without rerunning analysis. CSV and JSON exports contain a compact allowlisted report summary; CSV fields are quoted and spreadsheet formula-like text is neutralized. Use **Print report** for the browser's print/save-as-PDF workflow. No server-generated PDF, migration, or new report dependency is required. Reports distinguish numerical outputs from interpretation: spectral clusters are not validated land-cover classes, change masks are candidate changes rather than confirmed events, and thresholds are not universal.
+
+### Two-scene change detection
+
+In **Detect candidate NDVI change**, choose a dated baseline and a later comparison scene. `POST /api/imagery/change-detection` validates distinct scene IDs, owner access to both scenes, acquisition-date order, sensor/platform metadata when present, and separate red/NIR mappings for each scene. Sentinel-2-style B04/B08 labels can be suggested, but metadata is unverified; select the actual band numbers when labels are absent or uncertain. Only NDVI difference is currently supported.
+
+The method calculates `(comparison-date NDVI) - (baseline-date NDVI)`. The comparison raster is reprojected/resampled onto the baseline raster grid with bilinear resampling of continuous reflectance bands; output CRS, affine transform, dimensions, and nodata grid follow the baseline. Common finite, non-nodata pixels with non-zero NDVI denominators contribute to statistics. The configurable threshold is in absolute NDVI-difference units, and a pixel is a candidate change when `abs(difference) >= threshold`. Positive values mean relative NDVI increased and negative values mean it decreased; neither result confirms a real-world event.
+
+The response includes input dates and band mappings, alignment and nodata policy, valid/excluded and changed/unchanged pixel counts, difference statistics, warnings, and a candidate-change legend. Area is reported only for supported projected CRS units or unrotated geographic grids (using geodesic row pixel areas); otherwise the response explicitly leaves area unavailable. The authenticated `GET /api/imagery/analyses/{analysis_id}` and existing owner-scoped artifact download route retrieve results. Difference and mask GeoTIFFs and an EPSG:4326 map preview are stored with the existing job/artifact persistence; no migration or new database binary field is used. Scene metadata tags and band labels are not independently authenticated, and thresholds are not universal across sensors, seasons, or biomes.
+
+Verified open-data starting points (source access terms can change; review the provider terms before redistribution):
+
+- **Copernicus Sentinel data:** the Copernicus Data Space Ecosystem states Sentinel data are free, full and open, and requires user registration for EO data access. See the [official terms](https://dataspace.copernicus.eu/terms-and-conditions), [registration instructions](https://documentation.dataspace.copernicus.eu/Registration.html), [Sentinel-2 documentation](https://documentation.dataspace.copernicus.eu/Data/SentinelMissions/Sentinel2.html), and [Sentinel data legal notice](https://sentinels.copernicus.eu/documents/247904/690755/Sentinel_Data_Legal_Notice). The [Copernicus S3 documentation](https://documentation.dataspace.copernicus.eu/APIs/S3.html) describes authenticated S3-compatible downloads from `eodata.dataspace.copernicus.eu` and product/file download examples. Generated S3 credentials are account-bound secrets; do not put them in the browser.
+- **USGS Landsat Collection 2:** USGS operates a public [LandsatLook STAC API](https://landsatlook.usgs.gov/stac-server/) whose live collection `landsat-c2l2-sr` identifies Collection 2 Level-2 Surface Reflectance and links its license to the [Landsat Data Policy](https://d9-wret.s3.us-west-2.amazonaws.com/assets/palladium/production/s3fs-public/atoms/files/Landsat_Data_Policy.pdf). NASA's [Landsat data access overview](https://science.nasa.gov/mission/landsat/data-overview/) describes search/download tools and USGS commercial-cloud access via AWS. STAC provides searchable scene metadata and asset links; this application does not fetch those assets automatically.
+
+These sources provide actual observations; the application's generated test rasters and synthetic demo are not source scenes or evidence of satellite acquisition.
 
 ## Technologies
 
@@ -289,6 +340,11 @@ The endpoint calculates over a fixed 4x4 in-memory matrix and writes no files, u
 | GET | `/api/geoai/demo` | Deterministic in-memory synthetic calculation example |
 | GET | `/api/geoai/status`, `/api/geoai/risk-indicators` | GeoAI component status and rule-based risk indicators |
 | GET | `/api/geoai/history` | Temporal summary only for distinct raster acquisition-date tags |
+| GET | `/api/imagery/scenes`, `/api/imagery/scenes/{scene_id}` | List and inspect owned ingested GeoTIFF scenes |
+| GET | `/api/imagery/analysis-types` | List supported scene-analysis types and available band roles |
+| POST | `/api/imagery/scenes/{scene_id}/analyses` | Run an owned scene's NDVI, McFeeters NDWI, or K-means analysis |
+| POST | `/api/imagery/change-detection` | Compare two owned scenes using thresholded NDVI difference |
+| GET | `/api/imagery/analyses/{analysis_id}` | Retrieve scene analysis/change-detection status and result |
 | GET | `/api/geoai/model-evaluation` | Hold-out metrics only when sufficient metadata-dated observations exist |
 | POST | `/api/geoai/spatial-analysis`, `/api/geoai/vegetation-forecast`, `/api/geoai/land-cover-transitions` | Spatial summaries, exploratory forecast, and class transition analysis |
 | POST | `/api/satellite/search`, `/api/satellite/download` | Provider surface; live scene retrieval is incomplete and may return HTTP 501 |
@@ -299,7 +355,7 @@ The endpoint calculates over a fixed 4x4 in-memory matrix and writes no files, u
 | POST | `/api/analyze/landcover` | Run baseline class rules |
 | POST | `/api/analyze/change_detection` | Compare aligned current/historical NDVI |
 | POST | `/api/analyze/all` | Attempt each analysis and report unavailable results individually |
-| GET | `/api/results` | List persisted result bundles |
+| GET | `/api/results` | List paginated completed results by default; `include_incomplete=true` adds owner-scoped running/failed history metadata |
 | GET | `/api/results/{result_id}` | Read one JSON summary |
 | GET | `/api/analyses/{analysis_id}`, `/api/jobs/{job_id}` | Read analysis and synchronous job lifecycle records |
 | GET | `/api/results/{result_id}/artifacts` and registered artifact download routes | List and retrieve registered artifacts, owner-checked when authentication is required |

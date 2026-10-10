@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { clearExpiredSession, getSupabaseSession } from './supabase';
-import { api, apiBaseUrl, downloadArtifact, downloadResult, getAuthStatus, getDataset, getHealth, getResultArtifacts, getResultImage, getResultImageUrl, getResults, getSignedArtifactDownloadUrl, normalizeApiRootUrl, runAllAnalysis, runChangeDetection, runLandcover, runNDBI, runNDVI, runNDWI, uploadBand } from './api';
+import { analyzeImageryScene, api, apiBaseUrl, compareImageryScenes, downloadArtifact, downloadResult, getAnalysisRecord, getAuthStatus, getDataset, getHealth, getImageryAnalysis, getImageryAnalysisTypes, getImageryScene, getResultArtifacts, getResultImage, getResultImageUrl, getResults, getSignedArtifactDownloadUrl, ingestImagery, listImageryScenes, normalizeApiRootUrl, runAllAnalysis, runChangeDetection, runLandcover, runNDBI, runNDVI, runNDWI, uploadBand } from './api';
 
 vi.mock('./supabase', () => ({
   clearExpiredSession: vi.fn().mockResolvedValue(undefined),
@@ -105,6 +105,8 @@ describe('API service', () => {
     await runAllAnalysis();
     await getResults();
     await getResults(25);
+    await getResults(50, { includeIncomplete: true });
+    await getAnalysisRecord('analysis-1');
     await downloadResult('id-1', 'ndvi');
     expect(post.mock.calls.map(([path]) => path)).toEqual([
       '/analyze/ndvi',
@@ -117,6 +119,11 @@ describe('API service', () => {
     expect(get).toHaveBeenLastCalledWith('/results/id-1/download/ndvi', { responseType: 'blob' });
     expect(get.mock.calls).toContainEqual(['/results', { params: { offset: 0 } }]);
     expect(get.mock.calls).toContainEqual(['/results', { params: { offset: 25 } }]);
+    expect(get.mock.calls).toContainEqual([
+      '/results',
+      { params: { offset: 50, include_incomplete: true } },
+    ]);
+    expect(get.mock.calls).toContainEqual(['/analyses/analysis-1']);
   });
 
   it('builds a URL for the requested result layer', () => {
@@ -139,6 +146,22 @@ describe('API service', () => {
     );
   });
 
+  it('submits scene change detection through the authenticated imagery API', async () => {
+    const payload = {
+      baseline_scene_id: 'a'.repeat(32),
+      comparison_scene_id: 'b'.repeat(32),
+      baseline_band_mapping: { red: 1, nir: 2 },
+      comparison_band_mapping: { red: 1, nir: 2 },
+      threshold: 0.1,
+    };
+    const post = vi.spyOn(api, 'post').mockResolvedValue({ data: { status: 'completed' } });
+
+    await expect(compareImageryScenes(payload)).resolves.toEqual({ status: 'completed' });
+    expect(post).toHaveBeenCalledWith('/imagery/change-detection', payload, {
+      timeout: 300000,
+    });
+  });
+
   it('uploads GeoTIFF bands to the selected local dataset period', async () => {
     const post = vi.spyOn(api, 'post').mockResolvedValue({ data: { success: true } });
     const file = new File(['raster-data'], 'S2_B04.tif', { type: 'image/tiff' });
@@ -147,5 +170,50 @@ describe('API service', () => {
     expect(path).toBe('/dataset/current/upload');
     expect(body.get('file')).toBe(file);
     expect(options.onUploadProgress).toBeUndefined();
+  });
+
+  it('uploads scenes and retrieves persisted imagery metadata and artifacts', async () => {
+    const post = vi.spyOn(api, 'post').mockResolvedValue({ data: { success: true } });
+    const get = vi.spyOn(api, 'get').mockResolvedValue({ data: { scenes: [] } });
+    const file = new File(['scene-bytes'], 'scene.tif', { type: 'image/tiff' });
+    const onUploadProgress = vi.fn();
+
+    await ingestImagery(file, onUploadProgress);
+    await listImageryScenes();
+    await getImageryScene('scene-1');
+    await downloadArtifact('scene-1', 'preview.png');
+
+    expect(post).toHaveBeenCalledWith(
+      '/imagery/ingest',
+      expect.any(FormData),
+      { onUploadProgress, timeout: 300000 },
+    );
+    expect(post.mock.calls[0][1].get('file')).toBe(file);
+    expect(get).toHaveBeenNthCalledWith(1, '/imagery/scenes');
+    expect(get).toHaveBeenNthCalledWith(2, '/imagery/scenes/scene-1');
+    expect(get).toHaveBeenNthCalledWith(
+      3,
+      '/results/scene-1/artifacts/preview.png/download',
+      { responseType: 'blob' },
+    );
+  });
+
+  it('uses authenticated scene-analysis endpoints and gives processing an extended timeout', async () => {
+    const get = vi.spyOn(api, 'get').mockResolvedValue({ data: {} });
+    const post = vi.spyOn(api, 'post').mockResolvedValue({ data: {} });
+
+    await getImageryAnalysisTypes('scene-1');
+    await analyzeImageryScene('scene-1', { analysis_type: 'ndvi' });
+    await getImageryAnalysis('analysis-1');
+
+    expect(get).toHaveBeenNthCalledWith(1, '/imagery/analysis-types', {
+      params: { scene_id: 'scene-1' },
+    });
+    expect(post).toHaveBeenCalledWith(
+      '/imagery/scenes/scene-1/analyses',
+      { analysis_type: 'ndvi' },
+      { timeout: 300000 },
+    );
+    expect(get).toHaveBeenNthCalledWith(2, '/imagery/analyses/analysis-1');
   });
 });

@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import App from './App';
 
@@ -25,6 +25,10 @@ const service = vi.hoisted(() => ({
   getResult: vi.fn(),
   getResultArtifacts: vi.fn(),
   uploadBand: vi.fn(),
+  listImageryScenes: vi.fn(),
+  getImageryScene: vi.fn(),
+  ingestImagery: vi.fn(),
+  downloadArtifact: vi.fn(),
 }));
 
 const auth = vi.hoisted(() => ({
@@ -60,6 +64,7 @@ beforeEach(() => {
   service.getDataset.mockResolvedValue(emptyDataset);
   service.getResults.mockResolvedValue({ results: [] });
   service.getResultArtifacts.mockResolvedValue({ artifacts: [] });
+  service.listImageryScenes.mockResolvedValue({ scenes: [] });
   service.getSatelliteStatus.mockResolvedValue({ configured: false, provider: 'local', message: 'Stage-A local dataset mode is active.' });
   service.getGeoAIStatus.mockResolvedValue({ status: 'ok', available: true, components: ['spatial_analysis', 'forecasting', 'risk'] });
   service.getGeoAIDemoScenario.mockResolvedValue({
@@ -176,11 +181,11 @@ describe('dashboard', () => {
 
   it('reports timed-out API requests instead of presenting an empty result as success', async () => {
     service.getResults.mockRejectedValue({ code: 'ECONNABORTED' });
-    render(<App />);
+    const { container } = render(<App />);
 
-    expect(await screen.findByText(
+    await waitFor(() => expect(container.querySelector('.alert.error')).toHaveTextContent(
       'The request timed out. Check recent results before starting the analysis again.',
-    )).toBeInTheDocument();
+    ));
   });
 
   it('loads older saved results only when requested', async () => {
@@ -198,8 +203,12 @@ describe('dashboard', () => {
     expect(await screen.findByRole('button', { name: 'Load older results' })).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Load older results' }));
 
-    await waitFor(() => expect(service.getResults).toHaveBeenLastCalledWith(1));
-    expect(await screen.findByRole('option', { name: /NDWI/ })).toBeInTheDocument();
+    await waitFor(() => expect(service.getResults).toHaveBeenLastCalledWith(
+      1,
+      { includeIncomplete: true },
+    ));
+    const savedResultSelector = screen.getByLabelText('Load saved result');
+    expect(await within(savedResultSelector).findByRole('option', { name: /NDWI/ })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Load older results' })).not.toBeInTheDocument();
   });
 

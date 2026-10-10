@@ -5,10 +5,11 @@ import logging
 import mimetypes
 import os
 import re
+import shutil
 import tempfile
 from contextlib import contextmanager
 from contextvars import ContextVar
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from threading import BoundedSemaphore
 from time import monotonic
@@ -25,6 +26,7 @@ from rasterio.transform import Affine, array_bounds
 from rasterio.warp import transform_bounds
 from fastapi import APIRouter, Depends, File, Header, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from starlette.concurrency import run_in_threadpool
 
 from config import settings, validate_runtime_settings
 from auth import AuthenticatedUser, authenticated_user_id, current_user
@@ -47,6 +49,14 @@ from processing.preprocessing import (
     pixel_area_square_metres,
     raster_metadata,
 )
+from processing.imagery import ImageryValidationError, inspect_geotiff
+from processing.scene_change import run_ndvi_change_detection
+from processing.satellite_analysis import (
+    analysis_catalog,
+    run_satellite_analysis,
+    validate_band_mapping,
+)
+from api.schemas import SceneAnalysisRequest, SceneChangeDetectionRequest
 from processing.provenance import analysis_provenance, dataset_provenance
 from processing.visualization import save_class_png, save_index_png, save_rgb_preview
 from geoai import (
@@ -510,6 +520,1229 @@ def _validate_upload_alignment(upload_path: Path, dataset_dir: Path) -> None:
         raise
     except (RasterioError, OSError) as exc:
         raise DatasetError("The uploaded file is not a readable GeoTIFF.") from exc
+
+
+def _safe_imagery_filename(filename: str | None) -> str:
+    name = (filename or "").replace("\\", "/").rsplit("/", 1)[-1]
+    name = re.sub(r"[\x00-\x1f\x7f]", "", name).strip(" .")
+    return name[:255]
+
+
+def _local_imagery_scenes(limit: int) -> list[dict[str, Any]]:
+    scenes = []
+    if not settings.output_dir.is_dir():
+        return scenes
+    for directory in settings.output_dir.iterdir():
+        if not directory.is_dir() or not re.fullmatch(r"[0-9a-f]{32}", directory.name):
+            continue
+        summary_path = directory / "summary.json"
+        if not summary_path.is_file():
+            continue
+        try:
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if summary.get("analysis") == "imagery_ingestion" and isinstance(
+            summary.get("metadata"), dict
+        ):
+            scenes.append(summary)
+    return sorted(
+        scenes,
+        key=lambda scene: scene.get("created_at") or "",
+        reverse=True,
+    )[:limit]
+
+
+@router.post("/imagery/ingest", status_code=201)
+async def ingest_imagery(
+    file: UploadFile = File(...),
+    user: AuthenticatedUser | None = Depends(current_user),
+) -> dict:
+    original_filename = _safe_imagery_filename(file.filename)
+    if Path(original_filename).suffix.lower() not in {".tif", ".tiff"}:
+        raise HTTPException(
+            status_code=415,
+            detail="Upload a GeoTIFF file with a .tif or .tiff extension.",
+        )
+    media_type = (file.content_type or "").split(";", 1)[0].strip().lower()
+    if media_type and media_type not in {
+        "image/tiff",
+        "image/geotiff",
+        "application/octet-stream",
+    }:
+        raise HTTPException(status_code=415, detail="The upload must use a GeoTIFF media type.")
+
+    byte_limit = min(
+        settings.max_upload_bytes,
+        settings.max_raster_bytes,
+        settings.max_artifact_bytes,
+    )
+    total_bytes = 0
+    digest = hashlib.sha256()
+    try:
+        with tempfile.TemporaryDirectory(prefix="satellite-imagery-") as staging:
+            source_path = Path(staging) / "source.tif"
+            preview_path = Path(staging) / "preview.png"
+            with source_path.open("wb") as destination:
+                while chunk := await file.read(1024 * 1024):
+                    total_bytes += len(chunk)
+                    if total_bytes > byte_limit:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=f"File exceeds the configured {byte_limit // (1024 * 1024)} MB imagery limit.",
+                        )
+                    digest.update(chunk)
+                    destination.write(chunk)
+            if total_bytes == 0:
+                raise HTTPException(status_code=422, detail="The uploaded GeoTIFF is empty.")
+
+            try:
+                metadata = await run_in_threadpool(
+                    inspect_geotiff,
+                    source_path,
+                    preview_path,
+                    original_filename=original_filename,
+                    sha256=digest.hexdigest(),
+                    max_pixels=settings.max_imagery_pixels,
+                )
+            except ImageryValidationError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+            input_parameters = {"format": "GeoTIFF", "sha256": digest.hexdigest()}
+            try:
+                job_start = persistence_manager.start_job(
+                    uuid4().hex,
+                    "imagery_ingestion",
+                    input_parameters,
+                    owner_id=user.id if user else None,
+                    idempotency_key=digest.hexdigest(),
+                )
+            except Exception as exc:
+                logger.error(
+                    "Imagery ingestion could not register its processing job.",
+                    extra={
+                        "event": "imagery.job_registration_failed",
+                        "error_type": type(exc).__name__,
+                    },
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail="Imagery metadata storage is temporarily unavailable.",
+                ) from exc
+
+            retrying = False
+            if not job_start.created:
+                existing_record = persistence_manager.get_analysis(
+                    job_start.analysis_id,
+                    user.id if user else None,
+                )
+                existing_job = persistence_manager.get_job(
+                    job_start.job_id,
+                    user.id if user else None,
+                )
+                if (
+                    existing_record is not None
+                    and existing_job is not None
+                    and existing_record["status"] == "failed"
+                    and existing_job["status"] == "failed"
+                ):
+                    try:
+                        retrying = persistence_manager.retry_failed_imagery_job(
+                            job_start.analysis_id,
+                            job_start.job_id,
+                            input_parameters,
+                            user.id if user else None,
+                        )
+                    except Exception as exc:
+                        logger.error(
+                            "Failed imagery ingestion could not be resumed.",
+                            extra={
+                                "event": "imagery.retry_registration_failed",
+                                "job_id": job_start.job_id,
+                                "error_type": type(exc).__name__,
+                            },
+                        )
+                        raise HTTPException(
+                            status_code=503,
+                            detail="Imagery metadata storage is temporarily unavailable.",
+                        ) from exc
+                if not retrying:
+                    existing = _existing_analysis_response(
+                        job_start.analysis_id,
+                        job_start.job_id,
+                        "imagery_ingestion",
+                        input_parameters,
+                        user.id if user else None,
+                    )
+                    return {**existing, "duplicate": True}
+
+            result_id = job_start.analysis_id
+            result_dir = settings.output_dir / result_id
+            try:
+                settings.output_dir.mkdir(parents=True, exist_ok=True)
+                if result_dir.is_symlink():
+                    raise ValueError("Imagery output directory is not a safe directory.")
+                if result_dir.exists():
+                    if not result_dir.is_dir() or result_dir.resolve().parent != settings.output_dir.resolve():
+                        raise ValueError("Imagery output directory is not a safe directory.")
+                    allowed_files = {"source.tif", "preview.png", "summary.json"}
+                    for existing_path in result_dir.iterdir():
+                        if existing_path.is_symlink() or existing_path.name not in allowed_files:
+                            raise ValueError("Imagery output directory contains unexpected files.")
+                else:
+                    result_dir.mkdir(exist_ok=False)
+                shutil.copyfile(source_path, result_dir / "source.tif")
+                shutil.copyfile(preview_path, result_dir / "preview.png")
+                previous_summary = None
+                if retrying:
+                    try:
+                        candidate = json.loads(
+                            (result_dir / "summary.json").read_text(encoding="utf-8")
+                        )
+                    except (OSError, json.JSONDecodeError):
+                        candidate = None
+                    if (
+                        isinstance(candidate, dict)
+                        and candidate.get("analysis") == "imagery_ingestion"
+                        and candidate.get("id") == result_id
+                        and isinstance(candidate.get("metadata"), dict)
+                        and candidate["metadata"].get("sha256")
+                        == digest.hexdigest()
+                    ):
+                        previous_summary = candidate
+                        metadata = candidate["metadata"]
+                persistence_mode = (
+                    "cloud-private"
+                    if persistence_manager.cloud_persistence_active
+                    else "local-only"
+                )
+                result = {
+                    "success": True,
+                    "id": result_id,
+                    "job_id": job_start.job_id,
+                    "analysis": "imagery_ingestion",
+                    "status": "completed",
+                    "created_at": (
+                        previous_summary.get("created_at")
+                        if previous_summary
+                        else datetime.now(timezone.utc).isoformat()
+                    ),
+                    "metadata": metadata,
+                    "preview_url": (
+                        f"/api/results/{result_id}/artifacts/preview.png/download"
+                    ),
+                    "source_download_url": (
+                        f"/api/results/{result_id}/artifacts/source.tif/download"
+                    ),
+                    "persistence": {
+                        "mode": persistence_mode,
+                        "bucket": (
+                            settings.supabase_storage_bucket
+                            if persistence_mode == "cloud-private"
+                            else None
+                        ),
+                    },
+                }
+                _store_result(result_id, result_dir, result, job_start.job_id)
+                return result
+            except Exception as exc:
+                try:
+                    persistence_manager.fail_job(
+                        job_start.job_id,
+                        "Imagery artifacts could not be persisted.",
+                    )
+                except Exception as state_error:
+                    logger.error(
+                        "Imagery ingestion failure state could not be saved.",
+                        extra={
+                            "event": "imagery.job_state_update_failed",
+                            "job_id": job_start.job_id,
+                            "error_type": type(state_error).__name__,
+                        },
+                    )
+                logger.error(
+                    "Imagery ingestion did not complete.",
+                    extra={
+                        "event": "imagery.ingestion_failed",
+                        "job_id": job_start.job_id,
+                        "error_type": type(exc).__name__,
+                    },
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "Imagery artifacts could not be fully persisted. "
+                        "Recoverable local processing files were retained."
+                    ),
+                    headers={"X-Processing-Job-ID": job_start.job_id},
+                ) from exc
+    except HTTPException:
+        raise
+    except OSError as exc:
+        logger.error(
+            "Imagery upload staging failed.",
+            extra={
+                "event": "imagery.upload_staging_failed",
+                "error_type": type(exc).__name__,
+            },
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="The imagery upload could not be staged; try again later.",
+        ) from exc
+
+
+@router.get("/imagery/scenes")
+def list_imagery_scenes(
+    limit: int = Query(20, ge=1, le=50),
+    user: AuthenticatedUser | None = Depends(current_user),
+) -> dict:
+    scenes = persistence_manager.list_analyses_by_type(
+        "imagery_ingestion",
+        owner_id=user.id if user else None,
+        limit=limit,
+    )
+    if scenes is None:
+        if user is not None or settings.authentication_required:
+            summaries = []
+        else:
+            summaries = _local_imagery_scenes(limit)
+    else:
+        summaries = [
+            scene["summary"]
+            for scene in scenes
+            if isinstance(scene.get("summary"), dict)
+        ]
+    return {"success": True, "scenes": summaries}
+
+
+def _owned_imagery_scene(
+    scene_id: str,
+    owner_id: str | None,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    scene_id = _validated_id(scene_id)
+    record = persistence_manager.get_analysis(scene_id, owner_id=owner_id)
+    if record is not None:
+        if record["analysis"] != "imagery_ingestion" or not isinstance(
+            record["summary"], dict
+        ):
+            raise HTTPException(status_code=404, detail="Imagery scene was not found.")
+        return record["summary"], record
+    if owner_id is not None or settings.authentication_required:
+        raise HTTPException(status_code=404, detail="Imagery scene was not found.")
+    try:
+        summary_path = _result_directory(scene_id) / "summary.json"
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    except (HTTPException, OSError, json.JSONDecodeError):
+        raise HTTPException(status_code=404, detail="Imagery scene was not found.")
+    if summary.get("analysis") != "imagery_ingestion":
+        raise HTTPException(status_code=404, detail="Imagery scene was not found.")
+    return summary, None
+
+
+@router.get("/imagery/scenes/{scene_id}")
+def get_imagery_scene(
+    scene_id: str,
+    user: AuthenticatedUser | None = Depends(current_user),
+) -> dict:
+    summary, _ = _owned_imagery_scene(scene_id, user.id if user else None)
+    return summary
+
+
+def _copy_owned_scene_source(
+    scene_id: str,
+    owner_id: str | None,
+    scene_summary: dict[str, Any],
+    destination: Path,
+) -> dict[str, Any]:
+    try:
+        stored = persistence_manager.get_artifact(
+            scene_id,
+            "source.tif",
+            owner_id=owner_id,
+        )
+    except (ArtifactStorageError, OSError) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="The imagery scene is temporarily unavailable from private storage.",
+        ) from exc
+    if stored is None:
+        raise HTTPException(status_code=404, detail="The imagery source artifact was not found.")
+    source_stream, artifact = stored
+    byte_limit = min(settings.max_raster_bytes, settings.max_artifact_bytes)
+    if int(artifact.get("size_bytes", 0)) > byte_limit:
+        source_stream.close()
+        raise HTTPException(
+            status_code=413,
+            detail="The imagery source exceeds the configured processing file-size limit.",
+        )
+
+    expected_digest = scene_summary.get("metadata", {}).get("sha256")
+    digest = hashlib.sha256()
+    total_bytes = 0
+    try:
+        with destination.open("wb") as output:
+            while chunk := source_stream.read(1024 * 1024):
+                total_bytes += len(chunk)
+                if total_bytes > byte_limit:
+                    raise HTTPException(
+                        status_code=413,
+                        detail="The imagery source exceeds the configured processing file-size limit.",
+                    )
+                digest.update(chunk)
+                output.write(chunk)
+    except HTTPException:
+        raise
+    except (ArtifactStorageError, OSError) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="The imagery scene could not be read from private storage.",
+        ) from exc
+    finally:
+        source_stream.close()
+
+    if total_bytes <= 0 or total_bytes != int(artifact.get("size_bytes", total_bytes)):
+        raise HTTPException(
+            status_code=503,
+            detail="The imagery source artifact is incomplete in private storage.",
+        )
+    if expected_digest and digest.hexdigest() != expected_digest:
+        raise HTTPException(
+            status_code=503,
+            detail="The imagery source failed its stored integrity check.",
+        )
+    return artifact
+
+
+def _scene_analysis_artifacts(result_id: str, result: dict[str, Any]) -> list[dict[str, Any]]:
+    output = []
+    result_metadata = result["result"]
+    for artifact_name in (
+        result_metadata["preview"]["artifact_name"],
+        result_metadata["raster"]["artifact_name"],
+        "summary.json",
+    ):
+        output.append(
+            {
+                "artifact_name": artifact_name,
+                "artifact_type": (
+                    "image" if artifact_name == "preview.png"
+                    else "report" if artifact_name == "summary.json"
+                    else "raster"
+                ),
+                "download_url": (
+                    f"/api/results/{result_id}/artifacts/"
+                    f"{quote(artifact_name, safe='')}/download"
+                ),
+            }
+        )
+    return output
+
+
+def _fail_scene_analysis_job(job_id: str, detail: str) -> None:
+    try:
+        persistence_manager.fail_job(job_id, detail)
+    except Exception as state_error:
+        logger.error(
+            "Failed to persist satellite scene analysis failure state.",
+            extra={
+                "event": "scene_analysis.job_state_update_failed",
+                "job_id": job_id,
+                "error_type": type(state_error).__name__,
+            },
+        )
+
+
+@router.get("/imagery/analysis-types")
+def list_imagery_analysis_types(
+    scene_id: str | None = Query(default=None, min_length=32, max_length=32),
+    user: AuthenticatedUser | None = Depends(current_user),
+) -> dict:
+    scene_summary = None
+    scene_bands = []
+    if scene_id is not None:
+        scene_summary, _ = _owned_imagery_scene(
+            scene_id,
+            user.id if user else None,
+        )
+        metadata = scene_summary.get("metadata")
+        if not isinstance(metadata, dict):
+            raise HTTPException(status_code=422, detail="The imagery scene metadata is incomplete.")
+        scene_bands = [
+            band
+            for band in metadata.get("bands", [])
+            if isinstance(band, dict)
+        ]
+    catalog = analysis_catalog(
+        scene_summary.get("metadata") if scene_summary else None
+    )
+    if scene_summary is not None:
+        for item in catalog:
+            if item["id"] in {"ndvi", "ndwi"} and item["available"]:
+                item["availability_note"] = (
+                    "Band labels were read from the GeoTIFF and have not been independently verified."
+                )
+            elif item["id"] in {"ndvi", "ndwi"}:
+                item["availability_note"] = (
+                    "Choose the band numbers matching the documented roles before submitting."
+                )
+            elif item["id"] == "kmeans" and item["available"]:
+                item["availability_note"] = "Select 2–16 feature bands and 2–10 clusters."
+        return {
+            "success": True,
+            "scene_id": scene_summary["id"],
+            "band_count": scene_summary["metadata"].get("band_count"),
+            "bands": scene_bands,
+            "analysis_types": catalog,
+        }
+    return {"success": True, "analysis_types": catalog}
+
+
+def _scene_date(metadata: dict[str, Any], role: str) -> date:
+    value = metadata.get("acquisition_date")
+    try:
+        if not isinstance(value, str):
+            raise ValueError
+        parsed = date.fromisoformat(value)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"The {role} scene has no valid acquisition date in its source metadata.",
+        ) from exc
+    return parsed
+
+
+def _sensor_identity(metadata: dict[str, Any], key: str) -> str | None:
+    value = metadata.get(key)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    normalized = re.sub(r"[^a-z0-9]+", "", value.casefold())
+    if key == "sensor":
+        if "msi" in normalized or "sentinel2" in normalized:
+            return "sentinel2msi"
+        if "oli" in normalized or "tirs" in normalized:
+            return "landsatoli"
+    if "sentinel2" in normalized or re.search(r"s2[ab]", normalized):
+        return "sentinel2"
+    if "landsat" in normalized or re.search(r"lc0[89]", normalized):
+        return "landsat"
+    return normalized
+
+
+def _validate_scene_sensor_compatibility(
+    baseline_metadata: dict[str, Any],
+    comparison_metadata: dict[str, Any],
+) -> list[str]:
+    warnings: list[str] = []
+    for identity_key in ("sensor", "platform"):
+        baseline_identity = _sensor_identity(baseline_metadata, identity_key)
+        comparison_identity = _sensor_identity(comparison_metadata, identity_key)
+        if baseline_identity and comparison_identity:
+            if baseline_identity != comparison_identity:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "The scenes report incompatible "
+                        f"{identity_key} identities; compare scenes from compatible sensors."
+                    ),
+                )
+        else:
+            warnings.append(
+                f"{identity_key.title()} identity is missing or unverified for at least one scene."
+            )
+    return warnings
+
+
+def _validate_scene_band_identity(
+    metadata: dict[str, Any],
+    mapping: dict[str, int],
+    role: str,
+) -> None:
+    expected_codes = {"red": "B04", "nir": "B08"}
+    code_by_index = {
+        band.get("index"): band.get("code")
+        for band in metadata.get("bands", [])
+        if isinstance(band, dict) and isinstance(band.get("index"), int)
+    }
+    for spectral_role, index in mapping.items():
+        observed_code = code_by_index.get(index)
+        if observed_code in {"B02", "B03", "B04", "B08", "B11"} and observed_code != expected_codes[spectral_role]:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"The selected {role} band {index} is labelled {observed_code}, "
+                    f"not the required {spectral_role} band {expected_codes[spectral_role]}."
+                ),
+            )
+
+
+def _scene_change_artifacts(result_id: str) -> list[dict[str, str]]:
+    return [
+        {
+            "artifact_name": artifact_name,
+            "artifact_type": artifact_type,
+            "download_url": (
+                f"/api/results/{result_id}/artifacts/"
+                f"{quote(artifact_name, safe='')}/download"
+            ),
+        }
+        for artifact_name, artifact_type in (
+            ("preview.png", "image"),
+            ("ndvi-difference.tif", "raster"),
+            ("change-mask.tif", "raster"),
+            ("summary.json", "report"),
+        )
+    ]
+
+
+@router.post("/imagery/change-detection")
+def compare_imagery_scenes(
+    request: SceneChangeDetectionRequest,
+    user: AuthenticatedUser | None = Depends(current_user),
+) -> dict:
+    owner_id = user.id if user else None
+    baseline_summary, _ = _owned_imagery_scene(
+        request.baseline_scene_id,
+        owner_id,
+    )
+    comparison_summary, _ = _owned_imagery_scene(
+        request.comparison_scene_id,
+        owner_id,
+    )
+    baseline_metadata = baseline_summary.get("metadata")
+    comparison_metadata = comparison_summary.get("metadata")
+    if not isinstance(baseline_metadata, dict) or not isinstance(comparison_metadata, dict):
+        raise HTTPException(status_code=422, detail="A scene has incomplete imagery metadata.")
+
+    baseline_date = _scene_date(baseline_metadata, "baseline")
+    comparison_date = _scene_date(comparison_metadata, "comparison")
+    if comparison_date <= baseline_date:
+        raise HTTPException(
+            status_code=422,
+            detail="The comparison scene acquisition date must be later than the baseline date.",
+        )
+    compatibility_warnings = _validate_scene_sensor_compatibility(
+        baseline_metadata,
+        comparison_metadata,
+    )
+    input_parameters = {
+        "method": "ndvi_difference",
+        "baseline_scene_id": baseline_summary["id"],
+        "baseline_sha256": baseline_metadata.get("sha256"),
+        "baseline_acquisition_date": baseline_date.isoformat(),
+        "baseline_band_mapping": request.baseline_band_mapping,
+        "comparison_scene_id": comparison_summary["id"],
+        "comparison_sha256": comparison_metadata.get("sha256"),
+        "comparison_acquisition_date": comparison_date.isoformat(),
+        "comparison_band_mapping": request.comparison_band_mapping,
+        "threshold": request.threshold,
+        "threshold_units": "absolute NDVI difference",
+    }
+    idempotency_key = hashlib.sha256(
+        json.dumps(input_parameters, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+    with _analysis_slot():
+        try:
+            with tempfile.TemporaryDirectory(prefix="satellite-change-") as staging:
+                staging_directory = Path(staging)
+                baseline_path = staging_directory / "baseline.tif"
+                comparison_path = staging_directory / "comparison.tif"
+                baseline_artifact = _copy_owned_scene_source(
+                    baseline_summary["id"],
+                    owner_id,
+                    baseline_summary,
+                    baseline_path,
+                )
+                comparison_artifact = _copy_owned_scene_source(
+                    comparison_summary["id"],
+                    owner_id,
+                    comparison_summary,
+                    comparison_path,
+                )
+                try:
+                    with rasterio.open(baseline_path) as baseline, rasterio.open(
+                        comparison_path
+                    ) as comparison:
+                        baseline_mapping = validate_band_mapping(
+                            baseline,
+                            "ndvi",
+                            baseline_metadata,
+                            request.baseline_band_mapping,
+                        )
+                        comparison_mapping = validate_band_mapping(
+                            comparison,
+                            "ndvi",
+                            comparison_metadata,
+                            request.comparison_band_mapping,
+                        )
+                except DatasetError as exc:
+                    raise HTTPException(status_code=422, detail=str(exc)) from exc
+                except (RasterioError, OSError, ValueError) as exc:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="A stored scene source is not a readable GeoTIFF.",
+                    ) from exc
+                _validate_scene_band_identity(
+                    baseline_metadata,
+                    baseline_mapping,
+                    "baseline",
+                )
+                _validate_scene_band_identity(
+                    comparison_metadata,
+                    comparison_mapping,
+                    "comparison",
+                )
+                for role in ("red", "nir"):
+                    baseline_code = next(
+                        (
+                            band.get("code")
+                            for band in baseline_metadata.get("bands", [])
+                            if isinstance(band, dict)
+                            and band.get("index") == baseline_mapping[role]
+                        ),
+                        None,
+                    )
+                    comparison_code = next(
+                        (
+                            band.get("code")
+                            for band in comparison_metadata.get("bands", [])
+                            if isinstance(band, dict)
+                            and band.get("index") == comparison_mapping[role]
+                        ),
+                        None,
+                    )
+                    if (
+                        baseline_code in {"B02", "B03", "B04", "B08", "B11"}
+                        and comparison_code in {"B02", "B03", "B04", "B08", "B11"}
+                        and baseline_code != comparison_code
+                    ):
+                        raise HTTPException(
+                            status_code=422,
+                            detail=(
+                                f"The selected {role} bands have conflicting spectral labels "
+                                "between scenes; choose corresponding spectral bands."
+                            ),
+                        )
+
+                try:
+                    job_start = persistence_manager.start_job(
+                        uuid4().hex,
+                        "scene_change_detection",
+                        input_parameters,
+                        owner_id=owner_id,
+                        idempotency_key=idempotency_key,
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "Scene change detection could not register its processing job.",
+                        extra={
+                            "event": "scene_change.job_registration_failed",
+                            "error_type": type(exc).__name__,
+                        },
+                    )
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Change-detection metadata storage is temporarily unavailable.",
+                    ) from exc
+
+                result_id, job_id = job_start.analysis_id, job_start.job_id
+                retrying = False
+                if not job_start.created:
+                    existing_record = persistence_manager.get_analysis(result_id, owner_id)
+                    if (
+                        existing_record is None
+                        or existing_record["analysis"] != "scene_change_detection"
+                        or existing_record["input_parameters"] != input_parameters
+                    ):
+                        raise HTTPException(status_code=404, detail="Change-detection analysis was not found.")
+                    if existing_record["status"] == "failed":
+                        try:
+                            retrying = persistence_manager.retry_failed_job(
+                                result_id,
+                                job_id,
+                                input_parameters,
+                                owner_id,
+                            )
+                        except Exception as exc:
+                            logger.error(
+                                "Failed scene change-detection job could not be resumed.",
+                                extra={
+                                    "event": "scene_change.retry_registration_failed",
+                                    "job_id": job_id,
+                                    "error_type": type(exc).__name__,
+                                },
+                            )
+                            raise HTTPException(
+                                status_code=503,
+                                detail="Change-detection metadata storage is temporarily unavailable.",
+                            ) from exc
+                    if not retrying:
+                        if isinstance(existing_record.get("summary"), dict):
+                            return {**existing_record["summary"], "duplicate": True}
+                        status = existing_record["status"]
+                        return {
+                            "success": status != "failed",
+                            "id": result_id,
+                            "job_id": job_id,
+                            "analysis": "scene_change_detection",
+                            "status": "processing" if status in {"queued", "running"} else status,
+                            "error": existing_record.get("error"),
+                            "duplicate": True,
+                            "artifacts": [],
+                        }
+
+                result_directory = settings.output_dir / result_id
+                try:
+                    output_directory = settings.output_dir.resolve()
+                    output_directory.mkdir(parents=True, exist_ok=True)
+                    allowed_outputs = {
+                        "ndvi-difference.tif",
+                        "change-mask.tif",
+                        "preview.png",
+                        "summary.json",
+                    }
+                    if result_directory.is_symlink():
+                        raise ValueError("Output path is not safe.")
+                    if result_directory.exists():
+                        if (
+                            not result_directory.is_dir()
+                            or result_directory.resolve().parent != output_directory
+                        ):
+                            raise ValueError("Output path is not safe.")
+                        if any(
+                            item.is_symlink() or item.name not in allowed_outputs
+                            for item in result_directory.iterdir()
+                        ):
+                            raise ValueError("Output directory contains unexpected files.")
+                    else:
+                        result_directory.mkdir(exist_ok=False)
+                except Exception as exc:
+                    _fail_scene_analysis_job(
+                        job_id,
+                        "Scene change-detection outputs could not be staged safely.",
+                    )
+                    logger.error(
+                        "Scene change-detection output directory could not be prepared.",
+                        extra={
+                            "event": "scene_change.output_directory_failed",
+                            "job_id": job_id,
+                            "error_type": type(exc).__name__,
+                        },
+                    )
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Change-detection outputs could not be prepared safely.",
+                    ) from exc
+
+                try:
+                    change_result = run_ndvi_change_detection(
+                        baseline_path,
+                        comparison_path,
+                        result_directory,
+                        baseline_metadata=baseline_metadata,
+                        comparison_metadata=comparison_metadata,
+                        baseline_band_mapping=baseline_mapping,
+                        comparison_band_mapping=comparison_mapping,
+                        threshold=request.threshold,
+                        max_pixels=settings.max_imagery_pixels,
+                        max_output_bytes=settings.max_artifact_bytes,
+                        deadline_check=_check_analysis_deadline,
+                    )
+                    _check_analysis_deadline()
+                    result = {
+                        "success": True,
+                        "id": result_id,
+                        "job_id": job_id,
+                        "analysis": "scene_change_detection",
+                        "analysis_type": "ndvi_difference",
+                        "status": "completed",
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                        "baseline": {
+                            "id": baseline_summary["id"],
+                            "filename": baseline_metadata.get("original_filename"),
+                            "acquisition_date": baseline_date.isoformat(),
+                            "platform": baseline_metadata.get("platform"),
+                            "sensor": baseline_metadata.get("sensor"),
+                            "band_mapping": baseline_mapping,
+                            "source_size_bytes": baseline_artifact["size_bytes"],
+                        },
+                        "comparison": {
+                            "id": comparison_summary["id"],
+                            "filename": comparison_metadata.get("original_filename"),
+                            "acquisition_date": comparison_date.isoformat(),
+                            "platform": comparison_metadata.get("platform"),
+                            "sensor": comparison_metadata.get("sensor"),
+                            "band_mapping": comparison_mapping,
+                            "source_size_bytes": comparison_artifact["size_bytes"],
+                        },
+                        "result": {
+                            **change_result,
+                            "compatibility_warnings": compatibility_warnings,
+                        },
+                        "artifacts": _scene_change_artifacts(result_id),
+                    }
+                    _store_result(result_id, result_directory, result, job_id)
+                    logger.info(
+                        "Two-scene NDVI change detection completed.",
+                        extra={
+                            "event": "scene_change.job_completed",
+                            "job_id": job_id,
+                            "valid_pixels": change_result["valid_comparison_pixels"],
+                        },
+                    )
+                    return result
+                except DatasetError as exc:
+                    _fail_scene_analysis_job(job_id, str(exc))
+                    raise HTTPException(
+                        status_code=422,
+                        detail=str(exc),
+                        headers={"X-Processing-Job-ID": job_id},
+                    ) from exc
+                except Exception as exc:
+                    _fail_scene_analysis_job(
+                        job_id,
+                        "Scene change detection or artifact persistence failed.",
+                    )
+                    if isinstance(exc, HTTPException):
+                        raise
+                    logger.error(
+                        "Scene change detection failed.",
+                        extra={
+                            "event": "scene_change.job_failed",
+                            "job_id": job_id,
+                            "error_type": type(exc).__name__,
+                        },
+                    )
+                    raise HTTPException(
+                        status_code=503,
+                        detail=(
+                            "Scene change detection or artifact persistence failed. "
+                            "Recoverable local outputs, if any, were retained."
+                        ),
+                        headers={"X-Processing-Job-ID": job_id},
+                    ) from exc
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.error(
+                "Scene change detection could not stage its input scenes.",
+                extra={
+                    "event": "scene_change.staging_failed",
+                    "error_type": type(exc).__name__,
+                },
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="The selected scenes could not be staged for comparison.",
+            ) from exc
+
+
+@router.post("/imagery/scenes/{scene_id}/analyses")
+def analyze_imagery_scene(
+    scene_id: str,
+    request: SceneAnalysisRequest,
+    user: AuthenticatedUser | None = Depends(current_user),
+) -> dict:
+    owner_id = user.id if user else None
+    scene_summary, _ = _owned_imagery_scene(scene_id, owner_id)
+    metadata = scene_summary.get("metadata")
+    if not isinstance(metadata, dict):
+        raise HTTPException(status_code=422, detail="The imagery scene metadata is incomplete.")
+    if request.analysis_type == "kmeans" and request.band_mapping is not None:
+        raise HTTPException(
+            status_code=422,
+            detail="Band-role mappings apply only to NDVI or McFeeters NDWI.",
+        )
+    if request.analysis_type != "kmeans" and request.feature_bands is not None:
+        raise HTTPException(
+            status_code=422,
+            detail="Feature-band selections apply only to K-means classification.",
+        )
+
+    input_parameters = {
+        "scene_id": scene_summary["id"],
+        "scene_sha256": metadata.get("sha256"),
+        "analysis_type": request.analysis_type,
+        "band_mapping": request.band_mapping,
+        "feature_bands": request.feature_bands,
+        "cluster_count": request.cluster_count if request.analysis_type == "kmeans" else None,
+        "random_seed": request.random_seed if request.analysis_type == "kmeans" else None,
+    }
+    idempotency_key = hashlib.sha256(
+        json.dumps(input_parameters, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    with _analysis_slot():
+        try:
+            with tempfile.TemporaryDirectory(prefix="satellite-analysis-") as staging:
+                source_path = Path(staging) / "source.tif"
+                source_artifact = _copy_owned_scene_source(
+                    scene_summary["id"],
+                    owner_id,
+                    scene_summary,
+                    source_path,
+                )
+                try:
+                    with rasterio.open(source_path) as source:
+                        mapping = validate_band_mapping(
+                            source,
+                            request.analysis_type,
+                            metadata,
+                            request.band_mapping,
+                        ) if request.analysis_type in {"ndvi", "ndwi"} else None
+                        if request.analysis_type == "kmeans":
+                            bands = (
+                                request.feature_bands
+                                if request.feature_bands is not None
+                                else list(range(1, source.count + 1))
+                            )
+                            if any(not 1 <= index <= source.count for index in bands):
+                                raise DatasetError(
+                                    f"Feature band numbers must be between 1 and {source.count}."
+                                )
+                except DatasetError as exc:
+                    raise HTTPException(status_code=422, detail=str(exc)) from exc
+                except (RasterioError, OSError, ValueError) as exc:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="The stored imagery source is not a readable GeoTIFF.",
+                    ) from exc
+
+                try:
+                    job_start = persistence_manager.start_job(
+                        uuid4().hex,
+                        f"scene_{request.analysis_type}",
+                        input_parameters,
+                        owner_id=owner_id,
+                        idempotency_key=idempotency_key,
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "Satellite scene analysis could not register its processing job.",
+                        extra={
+                            "event": "scene_analysis.job_registration_failed",
+                            "error_type": type(exc).__name__,
+                        },
+                    )
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Analysis metadata storage is temporarily unavailable.",
+                    ) from exc
+
+                result_id, job_id = job_start.analysis_id, job_start.job_id
+                retrying = False
+                existing_record = None
+                if not job_start.created:
+                    existing_record = persistence_manager.get_analysis(result_id, owner_id)
+                    if (
+                        existing_record is None
+                        or existing_record["analysis"] != f"scene_{request.analysis_type}"
+                        or existing_record["input_parameters"] != input_parameters
+                    ):
+                        raise HTTPException(status_code=404, detail="Analysis was not found.")
+                    if existing_record["status"] == "failed":
+                        try:
+                            retrying = persistence_manager.retry_failed_job(
+                                result_id,
+                                job_id,
+                                input_parameters,
+                                owner_id,
+                            )
+                        except Exception as exc:
+                            logger.error(
+                                "Failed satellite scene analysis could not be resumed.",
+                                extra={
+                                    "event": "scene_analysis.retry_registration_failed",
+                                    "job_id": job_id,
+                                    "error_type": type(exc).__name__,
+                                },
+                            )
+                            raise HTTPException(
+                                status_code=503,
+                                detail="Analysis metadata storage is temporarily unavailable.",
+                            ) from exc
+                    if not retrying:
+                        if isinstance(existing_record.get("summary"), dict):
+                            return {**existing_record["summary"], "duplicate": True}
+                        status = existing_record["status"]
+                        return {
+                            "success": True,
+                            "id": result_id,
+                            "job_id": job_id,
+                            "analysis": existing_record["analysis"],
+                            "analysis_type": request.analysis_type,
+                            "status": "processing" if status in {"queued", "running"} else status,
+                            "error": existing_record.get("error"),
+                            "duplicate": True,
+                            "artifacts": [],
+                        }
+
+                try:
+                    output_directory = settings.output_dir.resolve()
+                    output_directory.mkdir(parents=True, exist_ok=True)
+                    result_directory = settings.output_dir / result_id
+                    allowed_outputs = {
+                        "ndvi.tif",
+                        "ndwi.tif",
+                        "classification.tif",
+                        "preview.png",
+                        "summary.json",
+                    }
+                    if result_directory.is_symlink():
+                        raise ValueError("Output path is not safe.")
+                    if result_directory.exists():
+                        if (
+                            not result_directory.is_dir()
+                            or result_directory.resolve().parent != output_directory
+                        ):
+                            raise ValueError("Output path is not safe.")
+                        for existing_path in result_directory.iterdir():
+                            if existing_path.is_symlink() or existing_path.name not in allowed_outputs:
+                                raise ValueError("Output directory contains unexpected files.")
+                except Exception as exc:
+                    _fail_scene_analysis_job(
+                        job_id,
+                        "Satellite scene processing could not prepare a safe output directory.",
+                    )
+                    logger.error(
+                        "Satellite scene analysis output directory could not be prepared.",
+                        extra={
+                            "event": "scene_analysis.output_directory_failed",
+                            "job_id": job_id,
+                            "error_type": type(exc).__name__,
+                        },
+                    )
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Analysis outputs could not be prepared safely.",
+                    ) from exc
+
+                try:
+                    analysis_result = run_satellite_analysis(
+                        source_path,
+                        result_directory,
+                        analysis=request.analysis_type,
+                        scene_metadata=metadata,
+                        band_mapping=mapping,
+                        feature_bands=request.feature_bands,
+                        cluster_count=request.cluster_count,
+                        random_seed=request.random_seed,
+                        max_pixels=settings.max_imagery_pixels,
+                        max_output_bytes=settings.max_artifact_bytes,
+                        deadline_check=_check_analysis_deadline,
+                    )
+                    _check_analysis_deadline()
+                    result = {
+                        "success": True,
+                        "id": result_id,
+                        "job_id": job_id,
+                        "analysis": f"scene_{request.analysis_type}",
+                        "analysis_type": request.analysis_type,
+                        "status": "completed",
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                        "scene": {
+                            "id": scene_summary["id"],
+                            "filename": metadata.get("filename"),
+                            "acquisition_date": metadata.get("acquisition_date"),
+                            "bands": metadata.get("bands", []),
+                        },
+                        "source_artifact": {
+                            "size_bytes": source_artifact["size_bytes"],
+                            "sha256": metadata.get("sha256"),
+                        },
+                        "result": analysis_result,
+                        "artifacts": [],
+                    }
+                    result["artifacts"] = _scene_analysis_artifacts(result_id, result)
+                    _store_result(result_id, result_directory, result, job_id)
+                    logger.info(
+                        "Satellite scene analysis completed.",
+                        extra={
+                            "event": "scene_analysis.job_completed",
+                            "job_id": job_id,
+                            "analysis_type": request.analysis_type,
+                        },
+                    )
+                    return result
+                except DatasetError as exc:
+                    _fail_scene_analysis_job(job_id, str(exc))
+                    raise HTTPException(
+                        status_code=422,
+                        detail=str(exc),
+                        headers={"X-Processing-Job-ID": job_id},
+                    ) from exc
+                except Exception as exc:
+                    _fail_scene_analysis_job(
+                        job_id,
+                        "Satellite scene processing or artifact persistence failed.",
+                    )
+                    if isinstance(exc, HTTPException):
+                        raise
+                    logger.error(
+                        "Satellite scene analysis failed.",
+                        extra={
+                            "event": "scene_analysis.job_failed",
+                            "job_id": job_id,
+                            "error_type": type(exc).__name__,
+                        },
+                    )
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Satellite scene processing or artifact persistence failed. "
+                        "Recoverable local outputs, if any, were retained.",
+                        headers={"X-Processing-Job-ID": job_id},
+                    ) from exc
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.error(
+                "Satellite scene analysis could not be staged.",
+                extra={
+                    "event": "scene_analysis.staging_failed",
+                    "error_type": type(exc).__name__,
+                },
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="The satellite scene could not be staged for analysis.",
+            ) from exc
+
+
+@router.get("/imagery/analyses/{analysis_id}")
+def get_imagery_analysis(
+    analysis_id: str,
+    user: AuthenticatedUser | None = Depends(current_user),
+) -> dict:
+    analysis_id = _validated_id(analysis_id)
+    record = persistence_manager.get_analysis(
+        analysis_id,
+        owner_id=user.id if user else None,
+    )
+    if record is not None:
+        if not isinstance(record["analysis"], str) or not record["analysis"].startswith("scene_"):
+            raise HTTPException(status_code=404, detail="Satellite scene analysis was not found.")
+        if isinstance(record.get("summary"), dict):
+            return record["summary"]
+        status = record["status"]
+        return {
+            "success": status != "failed",
+            "id": record["id"],
+            "analysis": record["analysis"],
+            "analysis_type": record["input_parameters"].get("analysis_type"),
+            "status": "processing" if status in {"queued", "running"} else status,
+            "error": record.get("error"),
+            "artifacts": [],
+        }
+    if user is not None or settings.authentication_required:
+        raise HTTPException(status_code=404, detail="Satellite scene analysis was not found.")
+    try:
+        summary_path = _result_directory(analysis_id) / "summary.json"
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    except (HTTPException, OSError, json.JSONDecodeError):
+        raise HTTPException(status_code=404, detail="Satellite scene analysis was not found.")
+    if not isinstance(summary, dict) or not str(summary.get("analysis", "")).startswith("scene_"):
+        raise HTTPException(status_code=404, detail="Satellite scene analysis was not found.")
+    return summary
 
 
 @router.post("/dataset/{period}/upload", status_code=201)
@@ -1637,24 +2870,41 @@ def analyze(
 def list_results(
     limit: int = Query(DEFAULT_RESULTS_PAGE_SIZE, ge=1, le=MAX_RESULTS_PAGE_SIZE),
     offset: int = Query(0, ge=0, le=10_000),
+    include_incomplete: bool = Query(False),
     user: AuthenticatedUser | None = Depends(current_user),
 ) -> dict:
     results_by_id = {}
     owner_id = user.id if user else None
     has_more = False
-    persisted_results = persistence_manager.list_analyses(
-        owner_id,
-        limit=limit,
-        offset=offset,
-    )
+    if include_incomplete:
+        persisted_results = persistence_manager.list_analyses(
+            owner_id,
+            limit=limit,
+            offset=offset,
+            include_incomplete=True,
+        )
+    else:
+        persisted_results = persistence_manager.list_analyses(
+            owner_id,
+            limit=limit,
+            offset=offset,
+        )
     if persisted_results is not None:
         has_more = len(persisted_results) > limit
         for result in persisted_results[:limit]:
-            results_by_id[result["id"]] = {
+            item = {
                 "id": result["id"],
                 "created_at": result["created_at"],
                 "analysis": result["analysis"],
             }
+            if include_incomplete:
+                item["status"] = result.get("status")
+                item["completed_at"] = result.get("completed_at")
+                item["history"] = _analysis_history_context(
+                    result.get("summary"),
+                    result.get("input_parameters"),
+                )
+            results_by_id[result["id"]] = item
         page = list(results_by_id.values())
         return {
             "success": True,
@@ -1688,11 +2938,15 @@ def list_results(
                 summary = json.loads(summary_path.read_text(encoding="utf-8"))
                 summary_id = summary.get("id")
                 if summary_id:
-                    results_by_id[summary_id] = {
+                    item = {
                         "id": summary_id,
                         "created_at": summary.get("created_at"),
                         "analysis": summary.get("analysis", "Analysis bundle"),
                     }
+                    if include_incomplete:
+                        item["status"] = "completed"
+                        item["history"] = _analysis_history_context(summary, {})
+                    results_by_id[summary_id] = item
             except (OSError, json.JSONDecodeError):
                 continue
     page = list(results_by_id.values())
@@ -1708,6 +2962,245 @@ def list_results(
     }
 
 
+def _analysis_history_context(
+    summary: Any,
+    input_parameters: Any,
+) -> dict[str, Any]:
+    summary = summary if isinstance(summary, dict) else {}
+    input_parameters = input_parameters if isinstance(input_parameters, dict) else {}
+    analysis_result = summary.get("result")
+    analysis_result = analysis_result if isinstance(analysis_result, dict) else summary
+
+    parameter_keys = (
+        "scene_id",
+        "analysis_type",
+        "method",
+        "band_mapping",
+        "feature_bands",
+        "cluster_count",
+        "random_seed",
+        "baseline_scene_id",
+        "baseline_band_mapping",
+        "comparison_scene_id",
+        "comparison_band_mapping",
+        "threshold",
+        "threshold_units",
+        "analysis_key",
+        "analysis_keys",
+        "dataset_ids",
+    )
+    parameters = {
+        key: input_parameters[key]
+        for key in parameter_keys
+        if key in input_parameters
+    }
+
+    source_scenes = []
+    for role, source_key, parameter_key in (
+        ("Scene", "scene", "scene_id"),
+        ("Baseline", "baseline", "baseline_scene_id"),
+        ("Comparison", "comparison", "comparison_scene_id"),
+    ):
+        source = summary.get(source_key)
+        source = source if isinstance(source, dict) else {}
+        metadata = source.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        scene_id = source.get("id") or input_parameters.get(parameter_key)
+        filename = (
+            source.get("filename")
+            or metadata.get("original_filename")
+            or metadata.get("filename")
+        )
+        if isinstance(filename, str):
+            filename = filename.replace("\\", "/").rsplit("/", 1)[-1]
+        acquisition_date = (
+            source.get("acquisition_date")
+            or metadata.get("acquisition_date")
+            or input_parameters.get(
+                f"{source_key}_acquisition_date"
+                if source_key != "scene"
+                else "acquisition_date"
+            )
+        )
+        if scene_id or filename or acquisition_date:
+            source_scenes.append(
+                {
+                    "role": role,
+                    "id": scene_id,
+                    "filename": filename,
+                    "acquisition_date": acquisition_date,
+                    "platform": source.get("platform"),
+                    "sensor": source.get("sensor"),
+                    "band_mapping": source.get("band_mapping"),
+                }
+            )
+
+    if not source_scenes and summary.get("analysis") == "imagery_ingestion":
+        metadata = summary.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        filename = metadata.get("original_filename") or metadata.get("filename")
+        if isinstance(filename, str):
+            filename = filename.replace("\\", "/").rsplit("/", 1)[-1]
+        source_scenes.append(
+            {
+                "role": "Uploaded scene",
+                "id": summary.get("id"),
+                "filename": filename,
+                "acquisition_date": metadata.get("acquisition_date"),
+            }
+        )
+
+    statistics = {}
+
+    def safe_history_value(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: safe_history_value(child)
+                for key, child in value.items()
+                if not any(
+                    sensitive in key.lower()
+                    for sensitive in (
+                        "owner",
+                        "error",
+                        "url",
+                        "path",
+                        "bucket",
+                        "storage",
+                        "token",
+                        "secret",
+                        "credential",
+                        "download",
+                    )
+                )
+            }
+        if isinstance(value, list):
+            return [safe_history_value(child) for child in value]
+        return value
+
+    def collect_statistics(value: Any, label: str = "", depth: int = 0) -> None:
+        if not isinstance(value, dict) or depth > 5:
+            return
+        statistic_values = value.get("statistics")
+        if isinstance(statistic_values, dict):
+            statistics[label or "Summary"] = safe_history_value(statistic_values)
+        for key, child in value.items():
+            if key != "statistics" and isinstance(child, dict):
+                collect_statistics(child, f"{label}.{key}".strip("."), depth + 1)
+
+    collect_statistics(analysis_result)
+    metric_keys = (
+        "total_pixels",
+        "total_target_pixels",
+        "valid_comparison_pixels",
+        "valid_pixels",
+        "excluded_pixels",
+        "changed_pixels",
+        "unchanged_pixels",
+        "valid_pixel_percentage",
+        "change_percentage_of_valid_pixels",
+        "positive_change_pixels",
+        "negative_change_pixels",
+        "area_square_metres",
+        "area_square_kilometres",
+        "valid_comparison_area_square_metres",
+        "changed_area_square_metres",
+        "positive_change_area_square_metres",
+        "negative_change_area_square_metres",
+    )
+    metrics = {
+        key: analysis_result[key]
+        for key in metric_keys
+        if key in analysis_result
+    }
+    if isinstance(analysis_result.get("classes"), list):
+        metrics["spectral_clusters"] = safe_history_value(analysis_result["classes"])
+    raster = analysis_result.get("raster")
+    raster = raster if isinstance(raster, dict) else {}
+    metadata = summary.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    spatial_keys = (
+        "crs",
+        "bounds_wgs84",
+        "width",
+        "height",
+        "resolution",
+        "resolution_units",
+        "transform",
+        "nodata",
+        "nodata_value",
+        "dtype",
+        "extent_wgs84",
+    )
+    spatial_metadata = {
+        key: analysis_result[key]
+        for key in spatial_keys
+        if key in analysis_result
+    }
+    if "bounds" in analysis_result and "bounds_wgs84" not in spatial_metadata:
+        spatial_metadata["bounds_wgs84"] = analysis_result["bounds"]
+    for key in (*spatial_keys, "bounds"):
+        if key in raster and key not in spatial_metadata:
+            spatial_metadata[key] = raster[key]
+    alignment = analysis_result.get("alignment")
+    if isinstance(alignment, dict):
+        spatial_metadata["alignment"] = safe_history_value(
+            {
+                key: alignment[key]
+                for key in (
+                    "target",
+                    "resampling",
+                    "baseline_crs",
+                    "baseline_transform",
+                    "baseline_width",
+                    "baseline_height",
+                    "comparison_was_reprojected_or_resampled",
+                )
+                if key in alignment
+            }
+        )
+    if not spatial_metadata and metadata:
+        spatial_metadata.update({
+            key: metadata[key]
+            for key in (*spatial_keys, "bounds")
+            if key in metadata
+        })
+
+    method = (
+        summary.get("analysis_type")
+        or analysis_result.get("analysis_type")
+        or analysis_result.get("method")
+        or input_parameters.get("analysis_type")
+        or input_parameters.get("method")
+        or input_parameters.get("analysis_key")
+    )
+    threshold = analysis_result.get("threshold")
+    if threshold is None:
+        threshold = input_parameters.get("threshold")
+
+    return {
+        "source_scenes": source_scenes,
+        "parameters": parameters,
+        "method": method,
+        "statistics": statistics,
+        "metrics": metrics,
+        "threshold": threshold,
+        "threshold_units": (
+            analysis_result.get("threshold_units")
+            or input_parameters.get("threshold_units")
+        ),
+        "limitations": (
+            analysis_result.get("limitations")
+            or analysis_result.get("interpretation_note")
+        ),
+        "warnings": safe_history_value(
+            analysis_result.get("warnings")
+            or analysis_result.get("area_warnings")
+            or []
+        ),
+        "spatial_metadata": spatial_metadata,
+    }
+
+
 @router.get("/results/{result_id}")
 def get_result(
     result_id: str,
@@ -1715,7 +3208,9 @@ def get_result(
 ) -> dict:
     result_id = _validated_id(result_id)
     record = persistence_manager.get_analysis(result_id, user.id if user else None)
-    if record and record["summary"] is not None:
+    if record is not None:
+        if record["status"] != "completed" or record["summary"] is None:
+            raise HTTPException(status_code=404, detail="Result was not found.")
         return record["summary"]
     if user is not None or settings.authentication_required:
         raise HTTPException(status_code=404, detail="Result was not found.")

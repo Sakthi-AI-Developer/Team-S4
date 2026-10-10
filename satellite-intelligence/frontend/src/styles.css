@@ -113,6 +113,61 @@ h1 { font-size: 25px; letter-spacing: -.035em; margin: 0 0 7px; }
 .dataset-instructions { display: flex; gap: 8px; padding: 9px 15px 12px; border-top: 1px solid #2b3a3c; color: #b99f7b; font-size: 10px; }
 .dataset-instructions span { color: #9eaaa4; }
 .dataset-warning { margin: 0; padding: 0 15px 12px; color: #d0ad7a; font-size: 10px; }
+.imagery-ingestion { margin: 0 15px 14px; padding: 13px; border: 1px solid #2b3a3c; border-radius: 6px; background: #172124; }
+.imagery-ingestion .panel-header { padding: 0; }
+.imagery-ingestion h3 { margin: 0; font-size: 13px; font-weight: 600; }
+.imagery-ingestion-copy { max-width: 760px; color: #9eaaa4; font-size: 10px; line-height: 1.6; }
+.imagery-scene-select { display: grid; gap: 5px; max-width: 420px; margin-top: 12px; color: #9eaaa4; font-size: 10px; }
+.imagery-scene-select select { padding: 8px; border: 1px solid #344447; border-radius: 4px; background: #202d30; color: #dce8df; }
+.imagery-error { color: #e0a29a; font-size: 10px; }
+.imagery-scene-detail { display: grid; grid-template-columns: minmax(160px, 1fr) minmax(220px, 1fr); gap: 12px; align-items: start; margin-top: 14px; }
+.imagery-preview { width: 100%; max-height: 300px; object-fit: contain; background: #101819; border: 1px solid #344447; border-radius: 4px; }
+.imagery-scene-detail dl { display: grid; gap: 8px; margin: 0; font-size: 10px; }
+.imagery-scene-detail dl div { display: grid; grid-template-columns: minmax(95px, .7fr) 1.3fr; gap: 8px; }
+.imagery-scene-detail dt { color: #829194; }
+.imagery-scene-detail dd { margin: 0; overflow-wrap: anywhere; color: #d2ddd5; }
+.imagery-download { grid-column: 1 / -1; width: fit-content; padding: 0; border: 0; background: transparent; color: #add2b0; font-size: 10px; cursor: pointer; }
+.imagery-download:disabled { opacity: .6; cursor: wait; }
+.scene-analysis { grid-column: 1 / -1; display: grid; gap: 10px; padding: 12px; border: 1px solid #2b3a3c; border-radius: 5px; background: #141e20; }
+.scene-analysis-heading { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+.scene-analysis-heading h3 { margin: 0; font-size: 12px; }
+.scene-analysis-status { padding: 4px 7px; border: 1px solid #344447; border-radius: 12px; color: #b7c5bd; font-size: 9px; text-transform: capitalize; }
+.scene-analysis-status.status-completed { border-color: #416448; color: #add2b0; }
+.scene-analysis-status.status-failed { border-color: #744644; color: #e0a29a; }
+.scene-analysis-form { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 9px; align-items: end; }
+.scene-analysis-form > label { display: grid; gap: 5px; color: #9eaaa4; font-size: 10px; }
+.scene-analysis-form select { padding: 7px; border: 1px solid #344447; border-radius: 4px; background: #202d30; color: #dce8df; }
+.scene-analysis-form .scene-analysis-note { grid-column: 1 / -1; margin: 0; }
+.scene-analysis-note { color: #a5b0a9; font-size: 10px; line-height: 1.5; }
+.scene-feature-bands { display: flex; flex-wrap: wrap; gap: 8px 12px; margin: 0; padding: 8px; border: 1px solid #344447; border-radius: 4px; color: #9eaaa4; font-size: 10px; }
+.scene-feature-bands legend { padding: 0 4px; }
+.scene-feature-bands label { display: inline-flex; align-items: center; gap: 4px; }
+.scene-analysis-result { display: grid; gap: 9px; }
+.scene-analysis-result h4 { margin: 0; color: #d6e1d8; font-size: 12px; }
+.scene-analysis-result > p { margin: 0; color: #9eaaa4; font-size: 10px; }
+.scene-analysis-statistics { display: flex; flex-wrap: wrap; gap: 8px 18px; margin: 0; }
+.scene-analysis-statistics div { display: grid; gap: 3px; }
+.scene-analysis-statistics dt { color: #829194; font-size: 9px; }
+.scene-analysis-statistics dd { margin: 0; color: #d2ddd5; font-size: 11px; }
+.scene-analysis-legend { display: flex; flex-wrap: wrap; gap: 8px 14px; margin: 0; padding: 0; list-style: none; }
+.scene-analysis-legend li { display: flex; align-items: center; gap: 5px; color: #cbd6cf; font-size: 9px; }
+.scene-analysis-legend li > span { width: 12px; height: 12px; border-radius: 2px; }
+.scene-analysis-legend small { color: #829194; }
+.scene-change { display: grid; gap: 10px; margin-top: 12px; padding: 12px; border: 1px solid #2b3a3c; border-radius: 5px; background: #141e20; }
+.scene-change .scene-analysis-heading h3 { margin: 0; font-size: 12px; }
+.scene-change-form { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 9px; align-items: end; }
+.scene-change-form > label { display: grid; gap: 5px; color: #9eaaa4; font-size: 10px; }
+.scene-change-form select, .scene-change-form input { min-width: 0; padding: 7px; border: 1px solid #344447; border-radius: 4px; background: #202d30; color: #dce8df; }
+.scene-change-form > .scene-analysis-note { grid-column: 1 / -1; margin: 0; }
+.scene-change-bands { display: flex; flex-wrap: wrap; gap: 8px 12px; margin: 0; padding: 8px; border: 1px solid #344447; border-radius: 4px; color: #9eaaa4; font-size: 10px; }
+.scene-change-bands legend { padding: 0 4px; }
+.scene-change-bands label { display: grid; gap: 4px; min-width: 135px; }
+.scene-change-result { display: grid; gap: 9px; }
+.scene-change-result h4 { margin: 0; color: #d6e1d8; font-size: 12px; }
+.scene-change-result > p { margin: 0; color: #9eaaa4; font-size: 10px; }
+.scene-change-downloads { display: flex; flex-wrap: wrap; gap: 10px; }
+.scene-change-result .map-frame { min-height: 240px; }
+@media (max-width: 700px) { .imagery-scene-detail { grid-template-columns: 1fr; } }
 .text-button:disabled { opacity: .5; cursor: wait; }
 .analysis-panel { margin-top: 12px; }
 .analysis-actions { display: flex; flex-wrap: wrap; gap: 7px; padding: 0 15px 14px; }
@@ -338,4 +393,127 @@ h2 { font-size: 14px; letter-spacing: -.015em; margin: 0; }
   .map-footer { gap: 8px; align-items: flex-start; flex-direction: column; }
   .download-list { grid-template-columns: 1fr; }
   .footer { flex-wrap: wrap; gap: 8px; }
+}
+
+.gis-workspace { margin-top: 18px; padding: 15px; border: 1px solid #304044; border-radius: 7px; background: #141f21; }
+.gis-workspace-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.gis-workspace-heading .eyebrow { margin: 0 0 4px; }
+.gis-workspace-heading h3 { margin: 0; font-size: 14px; }
+.gis-projection-label { padding: 5px 7px; border: 1px solid #405448; border-radius: 4px; color: #b7d1b9; font: 9px var(--mono); }
+.gis-description, .gis-limitations { color: #98a7a6; font-size: 10px; line-height: 1.6; }
+.gis-add-controls { display: grid; grid-template-columns: minmax(150px, 1fr) auto minmax(180px, 1.2fr) auto auto; align-items: end; gap: 8px; margin: 13px 0; }
+.gis-add-controls label { display: grid; gap: 5px; min-width: 0; color: #a8b6b3; font-size: 9px; }
+.gis-add-controls select { width: 100%; min-width: 0; padding: 8px; border: 1px solid #344649; border-radius: 4px; color: #e0e9e5; background: #1a2729; font-size: 10px; }
+.gis-add-controls .secondary-button { min-height: 34px; padding: 7px 9px; white-space: nowrap; font-size: 9px; }
+.gis-text-button { padding: 7px; border: 0; color: #b6d7b6; background: transparent; cursor: pointer; font-size: 9px; }
+.gis-layout { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(260px, .9fr); gap: 12px; align-items: start; }
+.gis-map-column, .gis-layer-panel { min-width: 0; border: 1px solid #2d3c3e; border-radius: 5px; background: #192426; }
+.gis-map-toolbar { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px; border-bottom: 1px solid #2d3c3e; }
+.gis-map-toolbar button, .gis-layer-actions button, .gis-layer-title > button { padding: 5px 7px; border: 1px solid #3a4b4c; border-radius: 3px; color: #c3d0ca; background: #202d2f; cursor: pointer; font-size: 9px; }
+.gis-map-toolbar button:disabled, .gis-layer-actions button:disabled { opacity: .45; cursor: not-allowed; }
+.gis-map-frame { position: relative; height: 430px; background: #202b2d; }
+.gis-leaflet-map { width: 100%; height: 100%; background: #202b2d; }
+.gis-map-empty { display: flex; min-height: 280px; flex-direction: column; align-items: center; justify-content: center; gap: 8px; padding: 18px; color: #99aaa6; text-align: center; background: radial-gradient(ellipse at center, #22302e 0, #1b2729 52%, #172124 100%); }
+.gis-map-empty b { color: #d0ddd6; font-size: 12px; }
+.gis-map-empty span { font-size: 10px; }
+.gis-map-status { position: absolute; z-index: 1000; top: 9px; left: 9px; max-width: calc(100% - 18px); margin: 0; padding: 7px 9px; border: 1px solid #405448; border-radius: 4px; color: #d3e1d3; background: #14201de8; font-size: 9px; }
+.gis-tile-warning { top: auto; bottom: 32px; border-color: #625337; color: #eddbb7; background: #2c271de8; }
+.gis-location { display: grid; gap: 4px; padding: 9px 10px; border-top: 1px solid #2d3c3e; color: #94a5a2; font-size: 9px; }
+.gis-location b { color: #d2dfd7; font-size: 10px; }
+.gis-layer-panel { max-height: 560px; overflow: auto; padding: 10px; }
+.gis-layer-panel h4 { display: flex; justify-content: space-between; margin: 0 0 8px; color: #d3dfd8; font-size: 11px; }
+.gis-layer-panel h4 span { color: #9bb89e; font: 10px var(--mono); }
+.gis-empty-layers { margin: 10px 0 2px; color: #95a5a2; font-size: 10px; }
+.gis-layer-list { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.gis-layer-list > li { min-width: 0; padding: 8px; border: 1px solid #2d3c3e; border-radius: 4px; background: #1d2a2c; }
+.gis-layer-list > li.selected { border-color: #59765c; }
+.gis-layer-title, .gis-layer-title label { display: flex; align-items: flex-start; gap: 7px; }
+.gis-layer-title { justify-content: space-between; }
+.gis-layer-title label { min-width: 0; color: #d4e1db; font-size: 10px; line-height: 1.45; }
+.gis-layer-title input { flex: 0 0 auto; margin: 2px 0 0; accent-color: #92c797; }
+.gis-layer-title label span { overflow-wrap: anywhere; }
+.gis-layer-title > button { flex: 0 0 auto; }
+.gis-layer-kind { margin: 5px 0; color: #91a19e; font-size: 9px; line-height: 1.5; }
+.gis-opacity { display: grid; grid-template-columns: auto minmax(40px, 1fr) 34px; align-items: center; gap: 6px; color: #aab8b3; font-size: 9px; }
+.gis-opacity input { width: 100%; accent-color: #91c397; }
+.gis-opacity output { color: #d0ddd5; font: 9px var(--mono); text-align: right; }
+.gis-layer-actions { display: flex; flex-wrap: wrap; gap: 4px; margin: 6px 0; }
+.gis-layer-actions button { padding: 4px 6px; font-size: 8px; }
+.gis-layer-status { margin: 5px 0; color: #cfdfd0; font-size: 9px; }
+.gis-layer-status.gis-error { color: #e6ada5; }
+.gis-layer-status button, .gis-inline-error button { margin-left: 6px; padding: 3px 6px; border: 1px solid #684543; border-radius: 3px; color: #f0c2bb; background: #392627; cursor: pointer; font-size: 9px; }
+.gis-layer-metadata { display: grid; gap: 4px; margin: 7px 0; padding: 7px 0; border-top: 1px solid #334244; border-bottom: 1px solid #334244; }
+.gis-layer-metadata div { display: grid; grid-template-columns: minmax(70px, .7fr) minmax(0, 1.3fr); gap: 6px; font-size: 8px; line-height: 1.5; }
+.gis-layer-metadata dt { color: #91a19e; }
+.gis-layer-metadata dd { min-width: 0; margin: 0; color: #c7d4ce; overflow-wrap: anywhere; }
+.gis-legend { display: grid; gap: 4px; margin: 7px 0 2px; padding: 0; list-style: none; }
+.gis-legend li { display: grid; grid-template-columns: 9px minmax(0, 1fr) auto; align-items: center; gap: 6px; color: #b8c7c0; font-size: 8px; }
+.gis-legend i { width: 8px; height: 8px; border-radius: 2px; }
+.gis-legend small { color: #879794; }
+.gis-inline-error { display: flex; align-items: center; gap: 8px; margin: 8px 0; padding: 8px; border: 1px solid #684543; border-radius: 4px; color: #e6b8b1; background: #322223; font-size: 9px; line-height: 1.5; }
+.gis-inline-error button { flex: 0 0 auto; margin-left: auto; }
+.gis-limitations { margin: 10px 0 0; }
+.gis-workspace button:focus-visible, .gis-workspace select:focus-visible, .gis-workspace input:focus-visible { outline: 2px solid #95cf9a; outline-offset: 2px; }
+
+.analysis-history { margin-top: 18px; }
+.analysis-history h2, .analysis-report h3 { margin-bottom: 0; }
+.history-filters { display: flex; flex-wrap: wrap; gap: 10px; margin: 12px 0; }
+.history-filters label { display: grid; gap: 5px; color: #aab8b3; font-size: 10px; }
+.history-filters select { min-width: 160px; padding: 7px 9px; border: 1px solid #354547; border-radius: 4px; color: #e5eceb; background: #121d20; }
+.history-list { display: grid; gap: 7px; }
+.history-entry { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 10px; border: 1px solid #2b3a3c; border-radius: 5px; background: #1a2629; }
+.history-entry-main { min-width: 0; display: grid; gap: 4px; }
+.history-entry-main strong { color: #dce8e2; font-size: 11px; }
+.history-entry-main small { color: #98a8a3; font-size: 9px; }
+.history-entry-main code { color: #829492; font: 9px var(--mono); overflow-wrap: anywhere; }
+.history-status { width: fit-content; padding: 3px 6px; border-radius: 3px; color: #b9c8c1; background: #283638; font: 9px var(--mono); text-transform: uppercase; }
+.history-status.status-completed { color: #b6dabc; background: #263a2e; }
+.history-status.status-failed { color: #e6b8b1; background: #3d2928; }
+.history-status.status-queued, .history-status.status-processing, .history-status.status-running { color: #e1cb97; background: #3a3528; }
+.history-state { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 10px 0; color: #aebbb6; font-size: 10px; }
+.history-error { color: #e6b8b1; }
+.history-more { margin-top: 10px; }
+.analysis-report { margin-top: 16px; padding: 14px; border: 1px solid #344547; border-radius: 6px; background: #141f21; }
+.report-heading { align-items: flex-start; }
+.report-heading h3 { margin-top: 0; font-size: 17px; }
+.report-heading small { display: block; margin-top: 6px; color: #9baaa5; font: 9px var(--mono); overflow-wrap: anywhere; }
+.analysis-report h4 { margin: 16px 0 7px; color: #d5e1da; font-size: 11px; }
+.report-metadata { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px 10px; margin: 8px 0; }
+.report-metadata div { display: grid; grid-template-columns: minmax(90px, .8fr) minmax(0, 1.2fr); gap: 8px; padding: 5px 7px; border: 1px solid #2a393c; border-radius: 3px; }
+.report-metadata dt { color: #95a6a1; font-size: 9px; text-transform: capitalize; }
+.report-metadata dd { min-width: 0; margin: 0; color: #d2ddd7; font-size: 9px; overflow-wrap: anywhere; }
+.report-list { padding-left: 18px; color: #cbd7d1; font-size: 10px; line-height: 1.6; }
+.report-interpretation { margin: 12px 0 6px; padding: 9px; border-left: 2px solid #95cf9a; color: #d4e2d8; background: #1b2a25; font-size: 10px; line-height: 1.6; }
+.report-artifacts, .report-actions { display: flex; flex-wrap: wrap; gap: 7px; margin: 10px 0; }
+.analysis-history button:focus-visible, .analysis-history select:focus-visible { outline: 2px solid #95cf9a; outline-offset: 2px; }
+
+@media (max-width: 1100px) {
+  .gis-add-controls { grid-template-columns: minmax(0, 1fr) auto; }
+  .gis-layout { grid-template-columns: minmax(0, 1.3fr) minmax(235px, .9fr); }
+}
+@media (max-width: 760px) {
+  .gis-workspace { padding: 10px; }
+  .gis-workspace-heading { align-items: flex-start; flex-direction: column; }
+  .gis-add-controls { grid-template-columns: minmax(0, 1fr); }
+  .gis-add-controls .secondary-button { justify-self: start; }
+  .gis-layout { grid-template-columns: minmax(0, 1fr); }
+  .gis-map-frame { height: 340px; }
+  .gis-layer-panel { max-height: none; }
+}
+@media (max-width: 480px) {
+  .gis-map-frame { height: 290px; }
+  .gis-layer-metadata div { grid-template-columns: minmax(65px, .65fr) minmax(0, 1.35fr); }
+  .history-entry { align-items: flex-start; flex-direction: column; }
+  .report-metadata { grid-template-columns: minmax(0, 1fr); }
+}
+
+@page { margin: 16mm; }
+@media print {
+  body * { visibility: hidden !important; }
+  .analysis-report, .analysis-report * { visibility: visible !important; }
+  .analysis-report { position: absolute; inset: 0; margin: 0; padding: 0; border: 0; color: #111; background: #fff; }
+  .analysis-report h3, .analysis-report h4, .analysis-report strong, .analysis-report dt, .analysis-report dd, .analysis-report p, .analysis-report li, .analysis-report small { color: #111 !important; }
+  .analysis-report .report-metadata div, .analysis-report .report-interpretation { border-color: #aaa; color: #111; background: #fff; break-inside: avoid; }
+  .analysis-report button, .analysis-report .report-actions, .analysis-report .report-artifacts { display: none !important; }
+  .analysis-report h4, .analysis-report .report-interpretation { break-after: avoid; }
 }

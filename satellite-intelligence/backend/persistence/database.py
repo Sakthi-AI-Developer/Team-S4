@@ -145,6 +145,75 @@ class PersistenceRepository:
                     analysis.completed_at = now
             session.add(JobStatusHistory(job_id=job_id, status=status, detail=detail, occurred_at=now))
 
+    def retry_failed_imagery_job(
+        self,
+        analysis_id: str,
+        job_id: str,
+        input_parameters: dict[str, Any],
+        owner_id: str | None = None,
+    ) -> bool:
+        return self.retry_failed_job(
+            analysis_id,
+            job_id,
+            input_parameters,
+            owner_id,
+            expected_analysis="imagery_ingestion",
+        )
+
+    def retry_failed_job(
+        self,
+        analysis_id: str,
+        job_id: str,
+        input_parameters: dict[str, Any],
+        owner_id: str | None = None,
+        *,
+        expected_analysis: str | None = None,
+    ) -> bool:
+        with self._sessions.begin() as session:
+            record = session.scalar(
+                select(AnalysisRecord)
+                .where(AnalysisRecord.id == analysis_id)
+                .with_for_update()
+            )
+            if (
+                record is None
+                or (
+                    expected_analysis is not None
+                    and record.analysis != expected_analysis
+                )
+                or record.owner_id != owner_id
+                or record.input_parameters != input_parameters
+                or record.status != "failed"
+            ):
+                return False
+            job = session.scalar(
+                select(ProcessingJob)
+                .where(
+                    ProcessingJob.id == job_id,
+                    ProcessingJob.analysis_id == analysis_id,
+                )
+                .with_for_update()
+            )
+            if job is None or job.status != "failed":
+                return False
+            now = utc_now()
+            record.status = "running"
+            record.error = None
+            record.completed_at = None
+            job.status = "running"
+            job.error = None
+            job.started_at = now
+            job.finished_at = None
+            session.add(
+                JobStatusHistory(
+                    job_id=job.id,
+                    status="running",
+                    detail="Retrying failed analysis processing.",
+                    occurred_at=now,
+                )
+            )
+            return True
+
     def complete_analysis(
         self,
         analysis_id: str,
@@ -210,11 +279,15 @@ class PersistenceRepository:
         owner_id: str | None = None,
         limit: int = 50,
         offset: int = 0,
+        *,
+        include_incomplete: bool = False,
     ) -> list[dict[str, Any]]:
         if not 1 <= limit <= 100 or offset < 0:
             raise ValueError("Analysis-list pagination is outside the supported range.")
         with self._sessions() as session:
-            query = select(AnalysisRecord).where(AnalysisRecord.status == "completed")
+            query = select(AnalysisRecord)
+            if not include_incomplete:
+                query = query.where(AnalysisRecord.status == "completed")
             if owner_id is not None:
                 query = query.where(AnalysisRecord.owner_id == owner_id)
             records = session.scalars(
@@ -222,13 +295,55 @@ class PersistenceRepository:
                 .limit(limit + 1)
                 .offset(offset)
             ).all()
+            results = []
+            for record in records:
+                item = {
+                    "id": record.id,
+                    "created_at": record.created_at.isoformat() if record.created_at else None,
+                    "analysis": record.analysis,
+                    "status": record.status,
+                    "owner_id": record.owner_id,
+                }
+                if include_incomplete:
+                    item.update(
+                        {
+                            "completed_at": (
+                                record.completed_at.isoformat()
+                                if record.completed_at
+                                else None
+                            ),
+                            "input_parameters": record.input_parameters,
+                            "summary": record.summary,
+                        }
+                    )
+                results.append(item)
+            return results
+
+    def list_analyses_by_type(
+        self,
+        analysis: str,
+        owner_id: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        if not 1 <= limit <= 100:
+            raise ValueError("Analysis-list limit is outside the supported range.")
+        with self._sessions() as session:
+            query = select(AnalysisRecord).where(
+                AnalysisRecord.analysis == analysis,
+                AnalysisRecord.status == "completed",
+            )
+            if owner_id is not None:
+                query = query.where(AnalysisRecord.owner_id == owner_id)
+            records = session.scalars(
+                query.order_by(AnalysisRecord.created_at.desc()).limit(limit)
+            ).all()
             return [
                 {
                     "id": record.id,
                     "created_at": record.created_at.isoformat() if record.created_at else None,
                     "analysis": record.analysis,
                     "status": record.status,
-                    "owner_id": record.owner_id,
+                    "summary": record.summary,
                 }
                 for record in records
             ]

@@ -28,6 +28,7 @@ class Settings:
     max_raster_bytes: int = 512 * 1024 * 1024
     max_artifact_bytes: int = 512 * 1024 * 1024
     max_raster_pixels: int = 1_000_000
+    max_imagery_pixels: int = 200_000_000
     max_input_array_bytes: int = 128 * 1024 * 1024
     max_analysis_seconds: int = 300
     max_concurrent_analyses: int = 1
@@ -129,6 +130,7 @@ settings = Settings(
     max_raster_bytes=int(os.getenv("MAX_RASTER_BYTES", str(512 * 1024 * 1024))),
     max_artifact_bytes=int(os.getenv("MAX_ARTIFACT_BYTES", str(512 * 1024 * 1024))),
     max_raster_pixels=int(os.getenv("MAX_RASTER_PIXELS", "1000000")),
+    max_imagery_pixels=int(os.getenv("MAX_IMAGERY_PIXELS", "200000000")),
     max_input_array_bytes=int(os.getenv("MAX_INPUT_ARRAY_BYTES", str(128 * 1024 * 1024))),
     max_analysis_seconds=int(os.getenv("MAX_ANALYSIS_SECONDS", "300")),
     max_concurrent_analyses=int(os.getenv("MAX_CONCURRENT_ANALYSES", "1")),
@@ -155,6 +157,8 @@ def validate_runtime_settings() -> list[str]:
         issues.append("MAX_ARTIFACT_BYTES must be positive.")
     if settings.max_raster_pixels <= 0:
         issues.append("MAX_RASTER_PIXELS must be positive.")
+    if settings.max_imagery_pixels <= 0:
+        issues.append("MAX_IMAGERY_PIXELS must be positive.")
     if settings.max_input_array_bytes <= 0:
         issues.append("MAX_INPUT_ARRAY_BYTES must be positive.")
     if settings.max_analysis_seconds < 1 or settings.max_analysis_seconds > 3600:

@@ -232,6 +232,40 @@ class PersistenceManager:
         if self.repository:
             self.repository.transition_job(job_id, "failed", error)
 
+    def retry_failed_imagery_job(
+        self,
+        analysis_id: str,
+        job_id: str,
+        input_parameters: dict[str, Any],
+        owner_id: str | None = None,
+    ) -> bool:
+        return bool(
+            self.repository
+            and self.repository.retry_failed_imagery_job(
+                analysis_id,
+                job_id,
+                input_parameters,
+                owner_id,
+            )
+        )
+
+    def retry_failed_job(
+        self,
+        analysis_id: str,
+        job_id: str,
+        input_parameters: dict[str, Any],
+        owner_id: str | None = None,
+    ) -> bool:
+        return bool(
+            self.repository
+            and self.repository.retry_failed_job(
+                analysis_id,
+                job_id,
+                input_parameters,
+                owner_id,
+            )
+        )
+
     def persist_result(
         self,
         result_id: str,
@@ -320,10 +354,29 @@ class PersistenceManager:
         return self.repository.get_analysis(result_id, owner_id) if self.repository else None
 
     def list_analyses(
-        self, owner_id: str | None = None, limit: int = 50, offset: int = 0
+        self,
+        owner_id: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+        *,
+        include_incomplete: bool = False,
     ) -> list[dict[str, Any]] | None:
         return (
-            self.repository.list_analyses(owner_id, limit=limit, offset=offset)
+            self.repository.list_analyses(
+                owner_id,
+                limit=limit,
+                offset=offset,
+                include_incomplete=include_incomplete,
+            )
+            if self.repository
+            else None
+        )
+
+    def list_analyses_by_type(
+        self, analysis: str, owner_id: str | None = None, limit: int = 50
+    ) -> list[dict[str, Any]] | None:
+        return (
+            self.repository.list_analyses_by_type(analysis, owner_id, limit)
             if self.repository
             else None
         )

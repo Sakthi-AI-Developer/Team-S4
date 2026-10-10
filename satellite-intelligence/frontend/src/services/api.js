@@ -71,6 +71,47 @@ export async function uploadBand(period, file, onUploadProgress) {
   })).data;
 }
 
+export async function ingestImagery(file, onUploadProgress) {
+  const body = new FormData();
+  body.append('file', file);
+  return (await api.post('/imagery/ingest', body, {
+    onUploadProgress,
+    timeout: 300000,
+  })).data;
+}
+
+export async function listImageryScenes() {
+  return (await api.get('/imagery/scenes')).data;
+}
+
+export async function getImageryScene(sceneId) {
+  return (await api.get(`/imagery/scenes/${encodeURIComponent(sceneId)}`)).data;
+}
+
+export async function getImageryAnalysisTypes(sceneId) {
+  return (await api.get('/imagery/analysis-types', {
+    params: sceneId ? { scene_id: sceneId } : undefined,
+  })).data;
+}
+
+export async function analyzeImageryScene(sceneId, payload) {
+  return (await api.post(
+    `/imagery/scenes/${encodeURIComponent(sceneId)}/analyses`,
+    payload,
+    { timeout: 300000 },
+  )).data;
+}
+
+export async function getImageryAnalysis(analysisId) {
+  return (await api.get(`/imagery/analyses/${encodeURIComponent(analysisId)}`)).data;
+}
+
+export async function compareImageryScenes(payload) {
+  return (await api.post('/imagery/change-detection', payload, {
+    timeout: 300000,
+  })).data;
+}
+
 export async function runNDVI() {
   return (await api.post('/analyze/ndvi')).data;
 }
@@ -111,8 +152,10 @@ export async function listSatelliteProducts() {
   return (await api.get('/satellite/products')).data;
 }
 
-export async function getResults(offset = 0) {
-  return (await api.get('/results', { params: { offset } })).data;
+export async function getResults(offset = 0, { includeIncomplete = false } = {}) {
+  return (await api.get('/results', {
+    params: { offset, ...(includeIncomplete ? { include_incomplete: true } : {}) },
+  })).data;
 }
 
 export async function getMetadata() {
@@ -161,6 +204,10 @@ export async function getGeoAIHistory() {
 
 export async function getResult(resultId) {
   return (await api.get(`/results/${encodeURIComponent(resultId)}`)).data;
+}
+
+export async function getAnalysisRecord(analysisId) {
+  return (await api.get(`/analyses/${encodeURIComponent(analysisId)}`)).data;
 }
 
 export async function getResultArtifacts(resultId) {

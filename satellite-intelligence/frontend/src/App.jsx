@@ -1,5 +1,6 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { apiRootUrl, downloadSatellite, getAuthStatus, getDataset, getGeoAIDemoScenario, getGeoAIHistory, getGeoAIModelEvaluation, getGeoAIRiskIndicators, getGeoAIStatus, getHealth, getResults, getResult, getResultArtifacts, getSatelliteStatus, runAllAnalysis, runChangeDetection, runGeoAILandCoverTransitions, runGeoAISpatialAnalysis, runGeoAIVegetationForecast, runLandcover, runNDBI, runNDVI, runNDWI, searchSatellite, uploadBand } from './services/api';
+import AnalysisHistory from './components/AnalysisHistory';
 import AnalysisPanel from './components/AnalysisPanel';
 import AuthPanel from './components/AuthPanel';
 import DatasetSelector from './components/DatasetSelector';
@@ -86,7 +87,10 @@ function App() {
   const [analyses, setAnalyses] = useState({});
   const [resultId, setResultId] = useState(null);
   const [recentResults, setRecentResults] = useState([]);
+  const [gisRequest, setGisRequest] = useState(null);
   const [nextResultsOffset, setNextResultsOffset] = useState(null);
+  const [resultsLoading, setResultsLoading] = useState(true);
+  const [resultsError, setResultsError] = useState('');
   const [loadingOlderResults, setLoadingOlderResults] = useState(false);
   const [resultLoading, setResultLoading] = useState(false);
   const [resultArtifacts, setResultArtifacts] = useState([]);
@@ -124,6 +128,8 @@ function App() {
     setAnalyses({});
     setResultId(null);
     setRecentResults([]);
+    setGisRequest(null);
+    setResultsError('');
     setResultArtifacts([]);
     setArtifactsError('');
     setDemoSummary(null);
@@ -152,14 +158,20 @@ function App() {
   }, []);
 
   const refreshResults = useCallback(async () => {
+    setResultsLoading(true);
+    setResultsError('');
     try {
-      const response = await getResults();
+      const response = await getResults(0, { includeIncomplete: true });
       setRecentResults(response.results ?? []);
       setNextResultsOffset(response.next_offset ?? null);
     } catch (requestError) {
       setRecentResults([]);
       setNextResultsOffset(null);
-      setError(friendlyError(requestError));
+      const message = friendlyError(requestError);
+      setResultsError(message);
+      setError(message);
+    } finally {
+      setResultsLoading(false);
     }
   }, []);
 
@@ -167,14 +179,17 @@ function App() {
     if (nextResultsOffset === null || loadingOlderResults) return;
     setLoadingOlderResults(true);
     try {
-      const response = await getResults(nextResultsOffset);
+      const response = await getResults(nextResultsOffset, { includeIncomplete: true });
       setRecentResults((previous) => {
         const existingIds = new Set(previous.map((item) => item.id));
         return [...previous, ...(response.results ?? []).filter((item) => !existingIds.has(item.id))];
       });
       setNextResultsOffset(response.next_offset ?? null);
+      setResultsError('');
     } catch (requestError) {
-      setError(friendlyError(requestError));
+      const message = friendlyError(requestError);
+      setResultsError(message);
+      setError(message);
     } finally {
       setLoadingOlderResults(false);
     }
@@ -521,6 +536,21 @@ function App() {
   }
 
   const datasetAvailable = Boolean(dataset?.current?.available);
+  const completedResults = useMemo(
+    () => recentResults.filter((item) => !item.status || item.status === 'completed'),
+    [recentResults],
+  );
+
+  const handleViewHistoryInGis = useCallback((id) => {
+    setDataSource('local');
+    setGisRequest((previous) => ({
+      id,
+      requestId: (previous?.requestId ?? 0) + 1,
+    }));
+    window.setTimeout(() => {
+      document.querySelector('.gis-workspace')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }, 0);
+  }, []);
 
   const handleDemoMode = useCallback(async () => {
     setDemoLoading(true);
@@ -683,6 +713,15 @@ function App() {
                 uploadingPeriod={uploadingPeriod ? `Uploading ${uploadProgress}%` : ''}
                 onUpload={handleUpload}
                 onRefresh={refreshDataset}
+                savedResults={completedResults}
+                resultsLoading={resultsLoading}
+                resultsError={resultsError}
+                hasMoreResults={nextResultsOffset !== null}
+                loadingMoreResults={loadingOlderResults}
+                onRefreshResults={refreshResults}
+                onLoadMoreResults={loadOlderResults}
+                onAnalysisCompleted={refreshResults}
+                requestedGisResult={gisRequest}
               />
             ) : (
               <div className="panel" style={{ margin: '0 15px 12px', padding: 14, border: '1px solid #2b3a3c', borderRadius: 8 }}>
@@ -990,7 +1029,7 @@ function App() {
               <div className="result-controls">
                 <select className="result-select" aria-label="Load saved result" onChange={handleSelectResult} value="">
                   <option value="">Select a saved result</option>
-                  {recentResults.map((item) => <option value={item.id} key={item.id}>{item.analysis} · {new Date(item.created_at).toLocaleString()}</option>)}
+                  {completedResults.map((item) => <option value={item.id} key={item.id}>{item.analysis} · {item.created_at ? new Date(item.created_at).toLocaleString() : 'date unknown'}</option>)}
                 </select>
                 {nextResultsOffset !== null && (
                   <button
@@ -1024,6 +1063,18 @@ function App() {
             <p className="panel-note">Satellite-derived indicators are not ground truth. Validate with field observations where needed. Stage B/live imagery is not enabled.</p>
           </article>
         </section>
+
+        <AnalysisHistory
+          key={authUser?.id ?? 'public'}
+          results={recentResults}
+          loading={resultsLoading}
+          error={resultsError}
+          hasMore={nextResultsOffset !== null}
+          loadingMore={loadingOlderResults}
+          onRefresh={refreshResults}
+          onLoadMore={loadOlderResults}
+          onViewInGis={handleViewHistoryInGis}
+        />
 
         <footer className="footer"><span>ORBITAL / INTEL</span><span>Scientific indicators · Stage A offline processing</span><span>Backend: {backendStatus === 'online' ? 'Connected' : backendStatus === 'checking' ? 'Checking' : 'Offline'}</span></footer>
       </main>
