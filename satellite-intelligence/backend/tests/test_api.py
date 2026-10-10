@@ -4,6 +4,7 @@ import os
 
 import httpx
 import numpy as np
+import pytest
 import rasterio
 from rasterio.io import MemoryFile
 from rasterio.transform import from_origin
@@ -140,6 +141,59 @@ def test_readiness_reports_migrated_analysis_schema(tmp_path):
     assert report["checks"]["schema"] == "ok"
     assert report["checks"]["storage"] == "unavailable"
     repository.close()
+
+
+@pytest.mark.parametrize(
+    ("initialize_schema", "expected_status", "expected_schema"),
+    [
+        pytest.param(False, 503, "unavailable", id="missing-schema"),
+        pytest.param(True, 200, "ok", id="schema-present"),
+    ],
+)
+def test_ready_endpoint_reports_schema_state(
+    tmp_path, monkeypatch, initialize_schema, expected_status, expected_schema
+):
+    from persistence.database import PersistenceRepository
+
+    cloud_settings = replace(
+        settings,
+        database_url=f"sqlite:///{tmp_path / 'ready-endpoint.sqlite'}",
+        supabase_url="https://project.example.test",
+        supabase_anon_key="local-only-anon-placeholder",
+        supabase_service_role_key="local-only-storage-placeholder",
+        require_auth=True,
+    )
+    repository = PersistenceRepository(cloud_settings.database_url)
+    if initialize_schema:
+        repository.create_schema_for_tests()
+
+    class AvailableStorage:
+        name = "supabase"
+
+        def check(self):
+            return None
+
+    manager = PersistenceManager(
+        cloud_settings,
+        repository=repository,
+        artifact_store=AvailableStorage(),
+    )
+    monkeypatch.setattr(routes, "persistence_manager", manager)
+    monkeypatch.setattr(routes, "validate_runtime_settings", lambda: [])
+
+    response = client.get("/api/ready")
+
+    assert response.status_code == expected_status
+    assert response.json()["checks"] == {
+        "configuration": "ok",
+        "database": "ok",
+        "schema": expected_schema,
+        "storage": "ok",
+    }
+    assert "local-only-anon-placeholder" not in response.text
+    assert "local-only-storage-placeholder" not in response.text
+    repository.close()
+
 
 def test_production_frontend_cors_preflight():
     origin = "https://team-s4-ten.vercel.app"
