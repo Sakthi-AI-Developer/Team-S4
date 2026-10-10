@@ -33,11 +33,18 @@ def verify_access_token(access_token: str) -> AuthenticatedUser:
     if (
         not supabase_url
         or not is_valid_supabase_url(supabase_url)
-        or not settings.supabase_anon_key
     ):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Authentication is not configured on the backend.",
+            detail=(
+                "Authentication requires SUPABASE_URL to be a valid HTTPS "
+                "Supabase project URL."
+            ),
+        )
+    if not settings.supabase_anon_key:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Authentication requires SUPABASE_ANON_KEY on the backend.",
         )
 
     try:

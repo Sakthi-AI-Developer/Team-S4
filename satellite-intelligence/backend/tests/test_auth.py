@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 from rasterio.io import MemoryFile
 from rasterio.transform import from_origin
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import ProgrammingError
 
 import api.routes as routes
 import auth as authentication
@@ -127,14 +128,29 @@ def test_malformed_expired_and_incorrectly_signed_tokens_are_rejected(monkeypatc
 
 
 def test_authentication_configuration_and_upstream_failures_are_explicit(monkeypatch):
-    monkeypatch.setattr(
-        authentication,
-        "settings",
-        replace(_auth_settings(), supabase_anon_key=None),
-    )
-    with pytest.raises(HTTPException) as missing_configuration:
-        authentication.verify_access_token("header.payload.signature")
-    assert missing_configuration.value.status_code == 503
+    for changes, expected_detail in (
+        (
+            {"supabase_url": None},
+            "Authentication requires SUPABASE_URL to be a valid HTTPS Supabase project URL.",
+        ),
+        (
+            {"supabase_url": "https://project.example.test/rest/v1"},
+            "Authentication requires SUPABASE_URL to be a valid HTTPS Supabase project URL.",
+        ),
+        (
+            {"supabase_anon_key": None},
+            "Authentication requires SUPABASE_ANON_KEY on the backend.",
+        ),
+    ):
+        monkeypatch.setattr(
+            authentication,
+            "settings",
+            replace(_auth_settings(), **changes),
+        )
+        with pytest.raises(HTTPException) as missing_configuration:
+            authentication.verify_access_token("header.payload.signature")
+        assert missing_configuration.value.status_code == 503
+        assert missing_configuration.value.detail == expected_detail
 
     monkeypatch.setattr(authentication, "settings", _auth_settings())
 
@@ -261,6 +277,7 @@ def test_authentication_middleware_protects_every_private_api_route(monkeypatch)
     monkeypatch.setattr(authentication.httpx, "get", reject_token)
     client = TestClient(app)
     public_routes = {
+        ("GET", "/"),
         ("GET", "/api/health"),
         ("GET", "/api/ready"),
         ("GET", "/api/auth/status"),
@@ -288,7 +305,167 @@ def test_authentication_middleware_protects_every_private_api_route(monkeypatch)
                 f"{method} {path} accepted an invalid token"
             )
 
+    assert client.get("/").status_code == 200
+    assert client.get("/api/health").status_code == 200
+    assert client.get("/api/ready").status_code == 200
     assert len(checked_routes) >= 30
+
+
+def test_database_error_context_contains_only_safe_postgres_diagnostics():
+    class Diagnostics:
+        schema_name = "public"
+        table_name = "analyses"
+        column_name = "idempotency_scope"
+        constraint_name = None
+
+    class DatabaseError:
+        sqlstate = "42703"
+        diag = Diagnostics()
+
+    error = ProgrammingError("SELECT ...", {}, DatabaseError())
+
+    context = application._database_error_context(error)
+
+    assert context == {
+        "database_error_sqlstate": "42703",
+        "database_error_schema": "public",
+        "database_error_table": "analyses",
+        "database_error_column": "idempotency_scope",
+    }
+
+
+def test_recovery_database_diagnostics_omit_bound_values():
+    class DatabaseError:
+        sqlstate = "42703"
+
+    statement = (
+        "SELECT analyses.id, analyses.owner_id FROM analyses "
+        "WHERE analyses.id = %(analysis_id)s"
+    )
+    error = ProgrammingError(
+        statement,
+        {"analysis_id": "private-analysis-id"},
+        DatabaseError(),
+    )
+
+    context = application._database_error_context(error, include_statement=True)
+
+    assert context["database_error_statement"] == statement
+    assert "private-analysis-id" not in repr(context)
+
+
+def test_authenticated_results_database_failure_logs_safe_sqlstate(monkeypatch):
+    configured = _auth_settings()
+    monkeypatch.setattr(application, "settings", configured)
+    monkeypatch.setattr(routes, "settings", configured)
+    monkeypatch.setattr(authentication, "settings", configured)
+
+    class DatabaseError:
+        sqlstate = "42703"
+
+        class Diagnostics:
+            schema_name = "public"
+            table_name = "analyses"
+            column_name = "idempotency_scope"
+            constraint_name = None
+
+        diag = Diagnostics()
+
+    class FailingManager:
+        def list_analyses(self, owner_id, limit, offset):
+            assert owner_id == "verified-user"
+            assert limit == 50
+            assert offset == 0
+            raise ProgrammingError(
+                "SELECT analyses.id FROM analyses WHERE analyses.owner_id = %(owner_id)s",
+                {"owner_id": "private-owner-value"},
+                DatabaseError(),
+            )
+
+    monkeypatch.setattr(routes, "persistence_manager", FailingManager())
+    monkeypatch.setattr(
+        authentication.httpx,
+        "get",
+        lambda *_args, **_kwargs: AuthResponse(200, {"id": "verified-user"}),
+    )
+    log_entries = []
+    monkeypatch.setattr(
+        application.logger,
+        "error",
+        lambda _message, *, extra: log_entries.append(extra),
+    )
+
+    response = TestClient(app, raise_server_exceptions=False).get(
+        "/api/results?offset=0",
+        headers={"Authorization": "Bearer test-user-token"},
+    )
+
+    assert response.status_code == 500
+    assert "private-owner-value" not in response.text
+    failure = next(
+        entry for entry in log_entries if entry.get("event") == "http.unhandled_error"
+    )
+    assert failure["http_route"] == "/results"
+    assert failure["error_type"] == "ProgrammingError"
+    assert failure["database_error_sqlstate"] == "42703"
+    assert failure["database_error_schema"] == "public"
+    assert failure["database_error_table"] == "analyses"
+    assert failure["database_error_column"] == "idempotency_scope"
+
+
+def test_startup_recovery_runs_after_database_connection_check(monkeypatch):
+    events = []
+
+    class Repository:
+        def check_connection(self):
+            events.append("database_checked")
+
+        def check_schema(self):
+            events.append("schema_checked")
+            return True
+
+    class ArtifactStore:
+        name = "local"
+
+    class StartupManager:
+        repository = Repository()
+        artifact_store = ArtifactStore()
+
+        def mark_interrupted_jobs(self):
+            assert events == ["database_checked", "schema_checked"]
+            events.append("recovery_ran")
+            return 0
+
+        def close(self):
+            events.append("closed")
+
+    monkeypatch.setattr(application, "persistence_manager", StartupManager())
+    with TestClient(app) as client:
+        assert client.get("/api/health").status_code == 200
+
+    assert events == [
+        "database_checked",
+        "schema_checked",
+        "recovery_ran",
+        "closed",
+    ]
+
+
+def test_render_start_command_migrates_before_starting_uvicorn():
+    blueprint = Path(__file__).resolve().parents[3] / "render.yaml"
+    content = blueprint.read_text(encoding="utf-8")
+    start_command = content.split("startCommand: >-", 1)[1].split(
+        "\n    healthCheckPath:", 1
+    )[0]
+    normalized_command = " ".join(start_command.split())
+
+    migration = (
+        "python -m alembic -c satellite-intelligence/backend/alembic.ini upgrade head"
+    )
+    assert 'test -n "$DATABASE_URL"' in normalized_command
+    assert "if [ -n" not in normalized_command
+    assert migration in normalized_command
+    assert normalized_command.index(migration) < normalized_command.index("uvicorn ")
 
 
 def _geotiff_bytes():
@@ -456,9 +633,40 @@ def test_owner_migration_preserves_legacy_rows_without_assigning_an_owner(
             ),
             {"analysis_id": "c" * 32},
         )
+        connection.execute(
+            text(
+                "INSERT INTO analyses "
+                "(id, analysis, input_parameters, status, created_at) "
+                "VALUES (:id, 'ndvi', '{}', 'running', '2026-01-01T00:00:00')"
+            ),
+            {"id": "e" * 32},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO processing_jobs "
+                "(id, analysis_id, status, input_parameters, created_at, started_at) "
+                "VALUES (:id, :analysis_id, 'running', '{}', "
+                "'2026-01-01T00:00:00', '2026-01-01T00:00:00')"
+            ),
+            {"id": "f" * 32, "analysis_id": "e" * 32},
+        )
     engine.dispose()
 
     command.upgrade(alembic_config, "head")
+
+    recovered_repository = PersistenceRepository(database_url)
+    assert recovered_repository.check_schema()
+    assert recovered_repository.mark_interrupted_jobs() == 1
+    recovered_analysis = recovered_repository.get_analysis("e" * 32)
+    recovered_job = recovered_repository.get_job("f" * 32)
+    assert recovered_analysis is not None
+    assert recovered_analysis["status"] == "failed"
+    assert recovered_job is not None
+    assert recovered_job["status"] == "failed"
+    assert recovered_job["error"] == "Backend restarted before processing completed."
+    migrated_results = recovered_repository.list_analyses(limit=10)
+    assert [result["id"] for result in migrated_results] == ["c" * 32]
+    recovered_repository.close()
 
     migrated = create_engine(database_url)
     with migrated.connect() as connection:

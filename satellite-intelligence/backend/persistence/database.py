@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, inspect, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
@@ -46,6 +46,19 @@ class PersistenceRepository:
     def check_connection(self) -> None:
         with self.engine.connect() as connection:
             connection.exec_driver_sql("SELECT 1")
+
+    def check_schema(self) -> bool:
+        inspector = inspect(self.engine)
+        table_names = set(inspector.get_table_names())
+        for table in Base.metadata.sorted_tables:
+            if table.name not in table_names:
+                return False
+            actual_columns = {
+                column["name"] for column in inspector.get_columns(table.name)
+            }
+            if not set(table.columns.keys()).issubset(actual_columns):
+                return False
+        return True
 
     def create_job(
         self,

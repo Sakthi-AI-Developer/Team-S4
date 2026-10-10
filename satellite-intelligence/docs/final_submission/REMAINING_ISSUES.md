@@ -3,6 +3,26 @@
 **Last checked:** 2026-10-10  
 This list separates observed deployment failures from checks blocked by missing credentials/data. No response body from the unauthenticated or malformed-token results probe was inspected; no exposure of specific user data is asserted. No real satellite screenshot or production output image was available.
 
+## Latest release blockers — 2026-10-10 (supersedes earlier live statuses)
+
+The later public checks differ from the historical observations below. Anonymous results now return 401 and the configured Vercel CORS preflight passes. The frontend and backend are nevertheless not ready for a private-data release:
+
+| ID | Priority | Latest status | Evidence | Required action |
+|---|---|---|---|---|
+| R-28 | **High** | **FAIL — frontend Auth configuration** | Live Vercel serves the current bundle and renders **“Authentication setup required”**, requesting `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY`. | Configure these two public Supabase variables in the authorized Vercel production build environment, rebuild/redeploy, and verify the sign-in form is usable. Never configure a service-role key or database password in Vercel. |
+| R-29 | **High** | **FAIL — backend Supabase Auth configuration** | Live `/api/auth/status` returns `authentication_required=true` and `supabase_auth_configured=false`. Missing-token results access is 401; invalid test bearer is rejected with 503 rather than 401. | In Render, verify/set `SUPABASE_URL` and `SUPABASE_ANON_KEY` using authorized controls. Then verify missing, malformed, expired, bad-signature, wrong-issuer, and wrong-audience tokens return 401; do not share their values in chat. |
+| R-30 | **High** | **FAIL — production readiness/Storage** | Live `/api/ready` is HTTP 503 with `configuration=unavailable`, `database=ok`, `storage=unavailable`. | Verify Render's `DATABASE_URL`, `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_STORAGE_BUCKET`, and `REQUIRE_AUTH=true` by variable name/presence and authorized secret validation. Confirm the bucket is private, then run a controlled test-object round trip only after approval. |
+| R-31 | **High** | **BLOCKED — live route parity and ownership** | Protected `/api/persistence/status`, `/api/geoai/demo`, and results requests return 401 without a token. Middleware rejection occurs before route dispatch; a valid test account/session is not available to verify handlers or cross-user isolation. | Use dedicated authorized test users and verify the protected handlers, own-record access, cross-user denial, and artifact authorization after Auth is configured. |
+| R-32 | **High** | **BLOCKED — full cloud persistence/workflow** | Readiness reports DB connectivity `ok`, but no database CRUD occurred; Storage is unavailable and no analysis was run with cloud credentials or an approved raster. | After staging/credential setup, verify reversible metadata CRUD, private Storage upload/download/cleanup, and one complete analysis with a dedicated identity and harmless approved raster. |
+| R-33 | **Medium** | **BLOCKED — platform configuration/revision mapping** | The live frontend uses the configured API hostname and its current asset matches the local build. Vercel/Render dashboards did not expose the active roots, deploy branches, service mapping, environment variables, or exact deployed commit. | Confirm Vercel root/build/output/branch and Render root/build/start/health/branch/hostname/active commit in the authorized dashboards. Do not infer hostname from the Render service name. |
+| R-34 | **Resolved for latest probe** | **PASS — trusted CORS preflight** | Trusted Vercel origin with `Idempotency-Key` returned HTTP 200; an untrusted origin returned HTTP 400 with no allow-origin. | Retest after any platform configuration or redeployment change. |
+| R-35 | **Resolved for latest probe** | **PASS — anonymous results denial** | `GET /api/results?limit=1` without credentials returned HTTP 401. | Retest after deployment; this does not prove valid-token handling or cross-user isolation. |
+| R-36 | **Low** | **NOT TESTED — Python dependency advisory scan** | `pip-audit` is not installed; `pip check` passes but is not an advisory vulnerability scan. | Run an approved Python advisory scanner when available. |
+
+The application tree was clean before these report updates. The repository is `main` at `7daa30a31aa8788c84a6278e27377cc78999b056`, matching `origin/main`; the commit contains 79 changed paths and is not a minimal security-only patch. This audit did not stage, commit, push, or deploy. After updating the reports, only the three report files are modified and unstaged; no paths are staged.
+
+**Release gate: BLOCKED.** Do not use the public site for private user imagery/results or claim production security until R-28 through R-33 are resolved and the live JWT, ownership, Storage, and workflow checks pass.
+
 ## Required before using the public deployment with private data
 
 | ID | Priority | Status | Evidence | Required action |

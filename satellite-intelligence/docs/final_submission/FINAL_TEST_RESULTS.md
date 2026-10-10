@@ -4,6 +4,49 @@
 **Scope:** Local tests/builds, local API startup, dependency checks, and read-only checks against the configured public deployment.  
 **Classification:** `PASS` = observed success for that exact check; `FAIL` = observed contract/behavior failure; `BLOCKED` = required credential/service/data was unavailable; `NOT TESTED` = no check executed. A passing HTTP health probe is not proof of cloud persistence.
 
+## Latest rerun and live recheck — 2026-10-10 (supersedes earlier snapshots)
+
+### Local automated checks
+
+| Check | Exact command / evidence | Result |
+|---|---|---|
+| Backend tests | From `satellite-intelligence/backend`: `& 'E:\project\Hackathon Erode\.venv\Scripts\python.exe' -m pytest -q` | **PASS** — 108 passed, 0 failed, 3 warnings in 13.78s. Warnings are Starlette/httpx and Alembic deprecations. |
+| Frontend tests | From `satellite-intelligence/frontend`: `npm test -- --run` | **PASS** — 3 files, 28 tests passed in 5.25s. |
+| Frontend production build | `npm run build` | **PASS, LOCAL ONLY** — Vite transformed 806 modules and emitted `dist/assets/index-BOqK-m93.js`. The emitted entry asset matches the one observed from the live frontend. |
+| NPM advisory audit | `npm audit --audit-level=high` | **PASS** — 0 vulnerabilities. |
+| Python dependency consistency | `& 'E:\project\Hackathon Erode\.venv\Scripts\python.exe' -m pip check` | **PASS** — no broken requirements found. |
+| Python syntax | `& 'E:\project\Hackathon Erode\.venv\Scripts\python.exe' -m compileall -q 'E:\project\Hackathon Erode\satellite-intelligence\backend'` | **PASS** — exit code 0. |
+| Git whitespace | `git diff --check` and `git diff --cached --check` | **PASS** — exit code 0; Git emitted line-ending conversion warnings for generated frontend assets. |
+| Python advisory audit | `pip-audit` availability check | **NOT TESTED** — `pip-audit` is not installed; no Python vulnerability advisory scan is claimed. |
+| Frontend bundle backend-secret scan | `rg -l 'SUPABASE_SERVICE_ROLE_KEY|DATABASE_URL' satellite-intelligence/frontend/dist` | **PASS, LIMITED** — neither backend-only variable name was found. This scan does not substitute for Vercel project-setting inspection. |
+
+### Live, read-only checks
+
+The URLs below are the configured public URLs. Their dashboard root/branch/host mapping and exact deployed commit were not available for independent confirmation.
+
+| Request / observation | Result | Interpretation |
+|---|---:|---|
+| `GET https://team-s4-ten.vercel.app/` | **200** | Frontend is reachable and references `/assets/index-BOqK-m93.js`. |
+| Browser-rendered sign-in state | **“Authentication setup required”** | **FAIL:** current frontend bundle lacks usable Supabase Auth configuration; it requests `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY`. |
+| Browser request to `https://satellite-vision-dashboard.onrender.com/api/auth/status` | **200** | Frontend reaches the configured API origin. |
+| `GET /api/health` on configured API | **200** | Reachability only. |
+| `GET /api/ready` on configured API | **503** | Public checks: `configuration=unavailable`, `database=ok`, `storage=unavailable`. The DB connectivity check passed; this is not metadata CRUD evidence. |
+| `GET /api/auth/status` on configured API | **200** | Safe boolean fields: `authentication_required=true`, `supabase_auth_configured=false`. |
+| `GET /api/results?limit=1`, no token | **401** | **PASS:** anonymous request rejected. Response body was not inspected. |
+| Same results request with invalid audit bearer | **503** | **FAIL-CLOSED, BLOCKED:** no results were returned; expected 401 behavior could not be confirmed because backend Auth is unconfigured/unavailable. |
+| `GET /api/persistence/status` and `/api/geoai/demo`, no token | **401** each | **PASS:** requests are blocked before access. Protected handler registration cannot be proven without valid auth. |
+| Trusted-origin `OPTIONS /api/analyze/all`, POST with `authorization,content-type,idempotency-key` | **200**; allow-origin matched Vercel and allow-headers included `Idempotency-Key` | **PASS:** current preflight behavior. |
+| Same preflight from `https://untrusted.example` | **400**; no allow-origin | **PASS:** untrusted origin rejected. |
+| Live Supabase Auth/JWT session and two-user isolation | Not run | **BLOCKED:** Auth status reports unconfigured; no dedicated test identities or valid session. |
+| Live database metadata CRUD | Not run | **BLOCKED:** readiness DB connection check is `ok`, but no authorized CRUD operation was performed. |
+| Private Storage policy and object round trip | Not run | **BLOCKED:** readiness reports storage unavailable; no cloud object was created. |
+| Complete authenticated satellite-analysis workflow | Not run | **BLOCKED:** Auth/Storage prerequisites and dedicated test identity/raster unavailable. |
+| Vercel/Render dashboard project settings | Not inspected | **BLOCKED:** authorized platform dashboard session unavailable. |
+
+### Git/release state at this rerun
+
+Branch `main` and `origin/main` both pointed to `7daa30a31aa8788c84a6278e27377cc78999b056` before the report update. The application worktree was clean then. The commit contains 79 changed paths (9,764 additions and 527 deletions), so it is not a minimal security-only patch. This audit did not stage, commit, push, or deploy. The later live frontend bundle matches the local committed build artifact, but no deployment SHA was exposed by either service. After writing the reports, exactly these three report files are modified and unstaged; no paths are staged.
+
 ## Follow-up verification — 2026-10-10
 
 ### Local regression rerun

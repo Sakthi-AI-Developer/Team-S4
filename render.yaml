@@ -1,11 +1,13 @@
+
 services:
   - type: web
     name: satellite-vision-api
     runtime: python
     buildCommand: pip install -r satellite-intelligence/backend/requirements.txt
     startCommand: >-
-      if [ -n "$DATABASE_URL" ]; then alembic -c satellite-intelligence/backend/alembic.ini upgrade head || exit $?; fi;
-      uvicorn --app-dir satellite-intelligence/backend main:app --host 0.0.0.0 --port $PORT
+      test -n "$DATABASE_URL" || { echo "DATABASE_URL must be configured before backend startup." >&2; exit 1; }
+      && python -m alembic -c satellite-intelligence/backend/alembic.ini upgrade head
+      && uvicorn --app-dir satellite-intelligence/backend main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /api/ready
     envVars:
       - key: PYTHON_VERSION

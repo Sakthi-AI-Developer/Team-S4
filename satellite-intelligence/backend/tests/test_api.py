@@ -84,6 +84,7 @@ def test_readiness_returns_503_without_exposing_dependency_errors(tmp_path, monk
     assert readiness.json()["checks"] == {
         "configuration": "ok",
         "database": "unavailable",
+        "schema": "unavailable",
         "storage": "unavailable",
     }
     serialized = readiness.text
@@ -91,6 +92,54 @@ def test_readiness_returns_503_without_exposing_dependency_errors(tmp_path, monk
     assert "private-host" not in serialized
     assert "private-key" not in serialized
     assert "signed-url" not in serialized
+
+
+def test_readiness_reports_missing_analysis_schema(tmp_path):
+    from persistence.database import PersistenceRepository
+
+    cloud_settings = replace(
+        settings,
+        database_url=f"sqlite:///{tmp_path / 'missing-schema.sqlite'}",
+        supabase_url=None,
+        supabase_anon_key=None,
+        supabase_service_role_key=None,
+        require_auth=False,
+    )
+    repository = PersistenceRepository(cloud_settings.database_url)
+    manager = PersistenceManager(cloud_settings, repository=repository)
+
+    report = manager.readiness([])
+
+    assert repository.check_schema() is False
+    assert report["status"] == "unavailable"
+    assert report["checks"]["database"] == "ok"
+    assert report["checks"]["schema"] == "unavailable"
+    repository.close()
+
+
+def test_readiness_reports_migrated_analysis_schema(tmp_path):
+    from persistence.database import PersistenceRepository
+
+    cloud_settings = replace(
+        settings,
+        database_url=f"sqlite:///{tmp_path / 'migrated-schema.sqlite'}",
+        supabase_url=None,
+        supabase_anon_key=None,
+        supabase_service_role_key=None,
+        require_auth=False,
+    )
+    repository = PersistenceRepository(cloud_settings.database_url)
+    repository.create_schema_for_tests()
+    manager = PersistenceManager(cloud_settings, repository=repository)
+
+    report = manager.readiness([])
+
+    assert repository.check_schema() is True
+    assert report["status"] == "unavailable"
+    assert report["checks"]["database"] == "ok"
+    assert report["checks"]["schema"] == "ok"
+    assert report["checks"]["storage"] == "unavailable"
+    repository.close()
 
 def test_production_frontend_cors_preflight():
     origin = "https://team-s4-ten.vercel.app"

@@ -161,19 +161,30 @@ class PersistenceManager:
         checks = {
             "configuration": "unavailable" if configuration_invalid else "ok",
             "database": "not_required",
+            "schema": "not_required",
             "storage": "not_required",
         }
 
         if database_required:
             if self.repository is None:
                 checks["database"] = "unavailable"
+                checks["schema"] = "unavailable"
             else:
                 try:
                     self.repository.check_connection()
                 except SQLAlchemyError:
                     checks["database"] = "unavailable"
+                    checks["schema"] = "unavailable"
                 else:
                     checks["database"] = "ok"
+                    try:
+                        schema_available = self.repository.check_schema()
+                    except SQLAlchemyError:
+                        checks["schema"] = "unavailable"
+                    else:
+                        checks["schema"] = (
+                            "ok" if schema_available else "unavailable"
+                        )
 
         if storage_required:
             if self.storage_configuration_error or self.artifact_store.name != "supabase":

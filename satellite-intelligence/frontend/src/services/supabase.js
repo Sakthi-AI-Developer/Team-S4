@@ -1,6 +1,27 @@
 import { createClient } from '@supabase/supabase-js';
 
-const url = import.meta.env.VITE_SUPABASE_URL?.trim();
+export function normalizeSupabaseProjectUrl(value) {
+  if (!value) return '';
+  try {
+    const parsed = new URL(value.trim());
+    if (
+      !parsed.hostname
+      || (parsed.protocol !== 'https:' && parsed.protocol !== 'http:')
+      || parsed.username
+      || parsed.password
+      || parsed.search
+      || parsed.hash
+      || (parsed.protocol === 'http:' && !['localhost', '127.0.0.1', '[::1]'].includes(parsed.hostname))
+    ) {
+      return '';
+    }
+    return parsed.origin;
+  } catch {
+    return '';
+  }
+}
+
+const url = normalizeSupabaseProjectUrl(import.meta.env.VITE_SUPABASE_URL);
 const anonKey = import.meta.env.VITE_SUPABASE_ANON_KEY?.trim();
 
 export const supabaseAuthConfigured = Boolean(url && anonKey);

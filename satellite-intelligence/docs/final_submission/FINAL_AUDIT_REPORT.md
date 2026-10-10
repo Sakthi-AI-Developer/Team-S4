@@ -5,6 +5,44 @@
 **Audit scope:** Current local source and configuration, available tests, short-lived local API execution, browser-visible deployed frontend, and safe read-only probes of the configured public API.  
 **Secret handling:** No credentials, private response content, or user data were printed or retained.
 
+## Latest verification — 2026-10-10 (supersedes the earlier live snapshot)
+
+### Current repository state
+
+- Branch: `main`; local `HEAD` and `origin/main`: `7daa30a31aa8788c84a6278e27377cc78999b056`.
+- Before this report update, the application worktree was clean. The current commit contains 79 changed paths (9,764 additions and 527 deletions), so it is a broad integrated change set rather than a minimal security-only patch.
+- This audit did not stage, commit, push, deploy, change platform settings, or modify cloud data. The current repository revision and observed public behavior changed during the verification window; the exact platform deployment commit remains unconfirmed.
+- After recording this verification, the only worktree changes are these three updated audit reports; they are unstaged. No paths are staged.
+
+### Latest live frontend and API evidence
+
+The configured public frontend and API were checked again after the repository revision changed. The API hostname below comes from `frontend/.env.production` and was also observed in the browser's API request; the Render Dashboard service-to-host mapping itself remains unverified.
+
+| Check | Latest evidence | Result |
+|---|---|---|
+| Vercel frontend | `GET https://team-s4-ten.vercel.app/` returned HTTP 200 and referenced `/assets/index-BOqK-m93.js`, matching the current committed Vite build. The browser rendered **“Authentication setup required”** and explicitly requested `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY`. | **PASS: current frontend bundle is served. FAIL: sign-in cannot be configured from the current build.** |
+| Frontend-to-API request | Browser resource observation showed `https://satellite-vision-dashboard.onrender.com/api/auth/status` returning HTTP 200. | **PASS: the page reaches its configured API host.** Does not prove Dashboard hostname mapping or deployment commit. |
+| API health and readiness | `/api/health` returned HTTP 200. `/api/ready` returned HTTP 503 with public checks `configuration=unavailable`, `database=ok`, `storage=unavailable`. | **PARTIAL:** API reachable and DB connection check succeeds; service is not ready because configuration and storage checks fail. This is not database CRUD proof. |
+| Authentication status | `/api/auth/status` returned HTTP 200 with `authentication_required=true` and `supabase_auth_configured=false`. | **FAIL/BLOCKED:** backend Supabase Auth is not configured according to its public status response. |
+| Private endpoints without credentials | `/api/persistence/status`, `/api/geoai/demo`, and `/api/results?limit=1` each returned HTTP 401 without authorization. | **PASS: unauthenticated requests are rejected.** A 401 before routing does not prove the protected handler is registered. |
+| Invalid bearer | `/api/results?limit=1` with a deliberately invalid test bearer returned HTTP 503, not a successful result response. | **FAIL-CLOSED, BUT BLOCKED:** no access was granted; the 503 is consistent with the backend's unavailable/missing Supabase Auth configuration. A real invalid-JWT-to-401 check remains unverified. |
+| CORS preflight, trusted origin | `OPTIONS /api/analyze/all` from `https://team-s4-ten.vercel.app`, requesting `POST` and `authorization,content-type,idempotency-key`, returned HTTP 200 and included the trusted origin plus `Idempotency-Key` in allowed headers. | **PASS: required preflight.** |
+| CORS preflight, untrusted origin | Same preflight from `https://untrusted.example` returned HTTP 400 and no allow-origin value. | **PASS: untrusted origin rejected.** |
+| Protected route parity | Current unauthenticated requests to persistence/demo paths return 401 due the authentication middleware; without a valid token, handler registration/parity cannot be conclusively checked. | **BLOCKED:** exact live route parity and deployment commit are not independently proven. |
+
+The preceding report sections preserve earlier observations (including 404s and stale bundle hash) as historical evidence. The later probes in this section supersede those observations for current response behavior; they do not prove which dashboard deployment or commit is active.
+
+### Current cloud verification and release verdict
+
+- **Database:** readiness's connection check reports `database=ok`. No authorized metadata CRUD transaction was performed, so database persistence is not fully verified.
+- **Supabase Auth:** backend status reports unconfigured; no valid test user/session was available. The frontend build likewise presents the explicit Supabase configuration-required state. JWT signature/issuer/audience/expiry rejection could not be live-verified.
+- **Storage:** readiness reports `storage=unavailable`; no private-bucket policy inspection or upload/download round trip was performed.
+- **Ownership/RLS:** local owner-scoped API tests pass, but live two-user isolation was not tested. The repository migrations still do not establish PostgreSQL RLS policies.
+- **Complete analysis workflow:** blocked by unavailable Auth/Storage configuration and lack of a dedicated authorized test identity/raster.
+- **Deployment controls:** no authorized Vercel/Render Dashboard access was available. Vercel build variables, Render secrets, active root/branch/commit, and actual service mapping therefore remain unverified.
+
+**Release verdict: BLOCKED; the public deployment is not safe for private user data.** Local security behavior and trusted CORS checks pass, but frontend and backend Supabase Auth configuration is incomplete, storage readiness fails, invalid-JWT behavior is not verified as 401, and live owner isolation and artifact persistence remain untested.
+
 ## Deployment/security blocker follow-up — 2026-10-10
 
 **Outcome: local security regressions PASS; public deployment remains FAIL/BLOCKED. No deployment was made.**

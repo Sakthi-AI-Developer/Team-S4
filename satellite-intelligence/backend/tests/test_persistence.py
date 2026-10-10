@@ -489,6 +489,7 @@ def test_app_startup_and_health_work_without_cloud_credentials(tmp_path, monkeyp
     assert readiness.json()["checks"] == {
         "configuration": "ok",
         "database": "not_required",
+        "schema": "not_required",
         "storage": "not_required",
     }
     assert status.status_code == 200
@@ -683,6 +684,18 @@ def test_supabase_authentication_and_analysis_artifact_ownership(tmp_path, monke
     assert api_client.get(
         "/api/results", headers={"Authorization": "Bearer invalid-token"}
     ).status_code == 401
+
+    empty_owner_list = api_client.get(
+        "/api/results?offset=0",
+        headers={"Authorization": "Bearer user-one-token"},
+    )
+    assert empty_owner_list.status_code == 200
+    assert empty_owner_list.json() == {
+        "success": True,
+        "results": [],
+        "has_more": False,
+        "next_offset": None,
+    }
 
     created = api_client.post(
         "/api/analyze/ndvi",

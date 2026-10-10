@@ -37,6 +37,13 @@ class JsonLogFormatter(logging.Formatter):
             "http_route",
             "status_code",
             "error_type",
+            "database_error_sqlstate",
+            "database_error_schema",
+            "database_error_table",
+            "database_error_column",
+            "database_error_constraint",
+            "database_error_statement",
+            "schema_issues",
             "issue_count",
             "job_id",
             "analysis",
@@ -62,6 +69,47 @@ def _allowed_origin_header(request: Request) -> dict[str, str]:
     return {}
 
 
+def _database_error_context(
+    exc: SQLAlchemyError, *, include_statement: bool = False
+) -> dict[str, str]:
+    original = getattr(exc, "orig", None)
+    sqlstate = getattr(original, "sqlstate", None) or getattr(original, "pgcode", None)
+    context: dict[str, str] = {}
+    if isinstance(sqlstate, str) and re.fullmatch(r"[A-Z0-9]{5}", sqlstate):
+        context["database_error_sqlstate"] = sqlstate
+
+    diagnostics = getattr(original, "diag", None)
+    for diagnostic_name in ("schema_name", "table_name", "column_name", "constraint_name"):
+        value = getattr(diagnostics, diagnostic_name, None)
+        if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_$.-]{1,128}", value):
+            context[f"database_error_{diagnostic_name.removesuffix('_name')}"] = value
+    statement = getattr(exc, "statement", None)
+    if include_statement and isinstance(statement, str):
+        normalized_statement = re.sub(r"\s+", " ", statement).strip()
+        if normalized_statement:
+            context["database_error_statement"] = normalized_statement[:512]
+    return context
+
+
+def _find_database_error(exc: BaseException) -> SQLAlchemyError | None:
+    pending = [exc]
+    visited: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in visited:
+            continue
+        visited.add(id(current))
+        if isinstance(current, SQLAlchemyError):
+            return current
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(current.exceptions)
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+    return None
+
+
 startup_issues = validate_runtime_settings()
 if startup_issues:
     logger.warning(
@@ -80,28 +128,53 @@ async def lifespan(_: FastAPI):
                 extra={
                     "event": "database.startup_check_failed",
                     "error_type": type(exc).__name__,
+                    **_database_error_context(exc),
                 },
             )
         else:
             try:
-                interrupted = persistence_manager.mark_interrupted_jobs()
+                schema_available = persistence_manager.repository.check_schema()
             except SQLAlchemyError as exc:
                 logger.error(
-                    "Interrupted analysis jobs could not be recovered at startup.",
+                    "Metadata database schema could not be verified at startup.",
                     extra={
-                        "event": "analysis.recovery_failed",
+                        "event": "database.schema_check_failed",
                         "error_type": type(exc).__name__,
+                        **_database_error_context(exc),
                     },
                 )
             else:
-                if interrupted:
-                    logger.warning(
-                        "Interrupted analysis jobs were marked failed.",
+                if not schema_available:
+                    logger.error(
+                        "Metadata database is missing required application tables or columns.",
                         extra={
-                            "event": "analysis.interrupted_jobs_recovered",
-                            "issue_count": interrupted,
+                            "event": "database.schema_incompatible",
+                            "error_type": "DatabaseSchemaMismatch",
                         },
                     )
+                else:
+                    try:
+                        interrupted = persistence_manager.mark_interrupted_jobs()
+                    except SQLAlchemyError as exc:
+                        logger.error(
+                            "Interrupted analysis jobs could not be recovered at startup.",
+                            extra={
+                                "event": "analysis.recovery_failed",
+                                "error_type": type(exc).__name__,
+                                **_database_error_context(
+                                    exc, include_statement=True
+                                ),
+                            },
+                        )
+                    else:
+                        if interrupted:
+                            logger.warning(
+                                "Interrupted analysis jobs were marked failed.",
+                                extra={
+                                    "event": "analysis.interrupted_jobs_recovered",
+                                    "issue_count": interrupted,
+                                },
+                            )
     if persistence_manager.artifact_store.name == "supabase":
         try:
             persistence_manager.artifact_store.check()
@@ -173,7 +246,7 @@ async def request_logging_middleware(request: Request, call_next):
 
 @app.middleware("http")
 async def authentication_middleware(request: Request, call_next):
-    public_paths = {"/api/health", "/api/ready", "/api/auth/status"}
+    public_paths = {"/", "/api/health", "/api/ready", "/api/auth/status"}
     if (
         not settings.authentication_required
         or request.method == "OPTIONS"
@@ -251,13 +324,19 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
 @app.exception_handler(Exception)
 async def unexpected_error_handler(request: Request, exc: Exception):
     route = request.scope.get("route")
+    database_error = _find_database_error(exc)
     logger.error(
         "Unhandled application error.",
         extra={
             "event": "http.unhandled_error",
             "http_route": getattr(route, "path", "unmatched"),
             "status_code": 500,
-            "error_type": type(exc).__name__,
+            "error_type": type(database_error or exc).__name__,
+            **(
+                _database_error_context(database_error)
+                if database_error is not None
+                else {}
+            ),
         },
     )
     return JSONResponse(
