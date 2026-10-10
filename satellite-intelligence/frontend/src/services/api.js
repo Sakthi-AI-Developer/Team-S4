@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { clearExpiredSession, getSupabaseSession } from './supabase';
 
 export function normalizeApiRootUrl(value) {
   return value?.trim().replace(/\/+$/, '').replace(/\/api$/i, '') || '';
@@ -9,6 +10,40 @@ export const apiRootUrl = configuredApiRootUrl || (import.meta.env.DEV ? 'http:/
 export const apiBaseUrl = `${apiRootUrl}/api`;
 export const api = axios.create({ baseURL: apiBaseUrl, timeout: 120000 });
 
+api.interceptors.request.use(async (config) => {
+  const session = await getSupabaseSession();
+  if (session?.access_token) {
+    config.headers.Authorization = `Bearer ${session.access_token}`;
+  }
+  if (
+    config.method === 'post'
+    && /^\/analyze(?:\/|$)/.test(config.url ?? '')
+    && !config.headers['Idempotency-Key']
+  ) {
+    const idempotencyKey = globalThis.crypto?.randomUUID?.();
+    if (idempotencyKey) config.headers['Idempotency-Key'] = idempotencyKey;
+  }
+  return config;
+});
+
+api.interceptors.response.use(
+  (response) => response,
+  async (error) => {
+    if (error.response?.status === 401 && typeof window !== 'undefined') {
+      let sessionClearFailed = false;
+      try {
+        await clearExpiredSession();
+      } catch {
+        sessionClearFailed = true;
+      }
+      window.dispatchEvent(new CustomEvent('satellite:auth-expired', {
+        detail: { sessionClearFailed },
+      }));
+    }
+    return Promise.reject(error);
+  },
+);
+
 export async function getHealth() {
   if (!apiRootUrl) {
     throw new Error('VITE_API_URL is required for production builds.');
@@ -18,6 +53,10 @@ export async function getHealth() {
     throw new Error('The API health endpoint returned an unexpected response.');
   }
   return data;
+}
+
+export async function getAuthStatus() {
+  return (await api.get('/auth/status')).data;
 }
 
 export async function getDataset() {
@@ -72,8 +111,8 @@ export async function listSatelliteProducts() {
   return (await api.get('/satellite/products')).data;
 }
 
-export async function getResults() {
-  return (await api.get('/results')).data;
+export async function getResults(offset = 0) {
+  return (await api.get('/results', { params: { offset } })).data;
 }
 
 export async function getMetadata() {
@@ -90,6 +129,10 @@ export async function getModelStatus() {
 
 export async function getGeoAIStatus() {
   return (await api.get('/geoai/status')).data;
+}
+
+export async function getGeoAIDemoScenario() {
+  return (await api.get('/geoai/demo')).data;
 }
 
 export async function runGeoAISpatialAnalysis(payload) {
@@ -120,6 +163,16 @@ export async function getResult(resultId) {
   return (await api.get(`/results/${encodeURIComponent(resultId)}`)).data;
 }
 
+export async function getResultArtifacts(resultId) {
+  return (await api.get(`/results/${encodeURIComponent(resultId)}/artifacts`)).data;
+}
+
+export async function getSignedArtifactDownloadUrl(resultId, artifactName) {
+  return (await api.get(`/results/${encodeURIComponent(resultId)}/signed-download`, {
+    params: { artifact_name: artifactName },
+  })).data;
+}
+
 export async function getVisualizationUrl(kind) {
   return `${apiBaseUrl}/visualization/${encodeURIComponent(kind)}`;
 }
@@ -127,6 +180,20 @@ export async function getVisualizationUrl(kind) {
 export async function downloadResult(resultId, fileKey) {
   return api.get(
     `/results/${encodeURIComponent(resultId)}/download/${encodeURIComponent(fileKey)}`,
+    { responseType: 'blob' },
+  );
+}
+
+export async function downloadArtifact(resultId, artifactName) {
+  return api.get(
+    `/results/${encodeURIComponent(resultId)}/artifacts/${encodeURIComponent(artifactName)}/download`,
+    { responseType: 'blob' },
+  );
+}
+
+export async function getResultImage(resultId, analysisKey) {
+  return api.get(
+    `/results/${encodeURIComponent(resultId)}/image/${encodeURIComponent(analysisKey)}`,
     { responseType: 'blob' },
   );
 }

@@ -8,6 +8,7 @@ import numpy as np
 from processing.ndbi import calculate_ndbi
 from processing.ndvi import calculate_ndvi
 from processing.ndwi import calculate_ndwi
+from processing.preprocessing import DatasetError, validate_alignment
 
 
 def _summarize_index(name: str, raster: np.ndarray, valid: np.ndarray, block_size: int = 10) -> dict[str, Any]:
@@ -17,8 +18,8 @@ def _summarize_index(name: str, raster: np.ndarray, valid: np.ndarray, block_siz
     if block_size <= 1:
         block_size = 1
     height, width = raster.shape
-    rows = max(1, height // block_size)
-    cols = max(1, width // block_size)
+    rows = max(1, math.ceil(height / block_size))
+    cols = max(1, math.ceil(width / block_size))
     aggregated = []
     for row in range(rows):
         for col in range(cols):
@@ -37,7 +38,6 @@ def _summarize_index(name: str, raster: np.ndarray, valid: np.ndarray, block_siz
                     "std": float(np.std(patch_values)),
                     "pixels": int(patch_values.size),
                 })
-    hotspot_values = sorted((item["mean"] for item in aggregated), key=lambda value: abs(value))
     return {
         "status": "ok",
         "name": name,
@@ -64,33 +64,65 @@ def summarize_spatial_patterns(current_dataset: Any, historical_dataset: Any | N
         return {"status": "insufficient-data", "message": "Current imagery is unavailable for spatial analysis."}
     if "B04" not in current_dataset.bands or "B08" not in current_dataset.bands:
         return {"status": "insufficient-data", "message": "NDVI spatial analysis requires B04 and B08."}
+    try:
+        validate_alignment([current_dataset.bands["B04"], current_dataset.bands["B08"]])
+    except DatasetError as exc:
+        return {"status": "insufficient-data", "message": str(exc)}
     ndvi = calculate_ndvi(current_dataset.bands["B04"], current_dataset.bands["B08"])
     ndwi = calculate_ndwi(current_dataset.bands["B03"], current_dataset.bands["B08"]) if "B03" in current_dataset.bands and "B08" in current_dataset.bands else None
     ndbi = calculate_ndbi(current_dataset.bands["B08"], current_dataset.bands["B11"]) if "B08" in current_dataset.bands and "B11" in current_dataset.bands else None
     spatial = {
         "status": "ok",
         "method": "Grid aggregation over valid pixels; no synthetic hotspots are generated.",
-        "limitations": "The result is a raster summary for the available AOI, not a validated ground-truth land-use map.",
+        "limitations": "The result summarizes the full input raster extent; no AOI clipping or ground-truth validation is performed.",
         "ndvi": _summarize_index("NDVI", ndvi["raster"], ndvi["valid_mask"], block_size=block_size),
         "ndwi": _summarize_index("NDWI", ndwi["raster"], ndwi["valid_mask"], block_size=block_size) if ndwi else {"status": "insufficient-data", "name": "NDWI", "message": "NDWI unavailable: B03 and B08 are required."},
         "ndbi": _summarize_index("NDBI", ndbi["raster"], ndbi["valid_mask"], block_size=block_size) if ndbi else {"status": "insufficient-data", "name": "NDBI", "message": "NDBI unavailable: B08 and B11 are required."},
     }
     if historical_dataset and historical_dataset.bands:
         try:
+            if "B04" not in historical_dataset.bands or "B08" not in historical_dataset.bands:
+                raise DatasetError("Historical NDVI requires B04 and B08.")
+            validate_alignment(
+                [
+                    historical_dataset.bands["B04"],
+                    historical_dataset.bands["B08"],
+                ]
+            )
+            current_reference = current_dataset.bands["B04"]
+            historical_reference = historical_dataset.bands["B04"]
+            if (
+                current_reference.width != historical_reference.width
+                or current_reference.height != historical_reference.height
+                or current_reference.crs != historical_reference.crs
+                or not np.allclose(
+                    tuple(current_reference.transform),
+                    tuple(historical_reference.transform),
+                    rtol=0,
+                    atol=1e-9,
+                )
+            ):
+                raise DatasetError("Current and historical NDVI rasters are not on the same grid.")
             historical_ndvi = calculate_ndvi(historical_dataset.bands["B04"], historical_dataset.bands["B08"])
-            if ndvi["valid_mask"].shape == historical_ndvi["valid_mask"].shape:
-                valid = ndvi["valid_mask"] & historical_ndvi["valid_mask"]
-                delta = np.full(ndvi["raster"].shape, np.nan, dtype=np.float32)
-                delta[valid] = ndvi["raster"][valid] - historical_ndvi["raster"][valid]
-                persistent_change = float(np.nanmean(delta[valid])) if np.any(valid) else None
-                spatial["persistent_change"] = {
-                    "mean_ndvi_delta": persistent_change,
-                    "change_pixels": int(np.count_nonzero(valid & (delta > 0.05))),
-                    "reduction_pixels": int(np.count_nonzero(valid & (delta < -0.05))),
-                    "status": "ok",
-                }
-        except Exception:
-            spatial["persistent_change"] = {"status": "insufficient-data", "message": "Historical change analysis could not be compared for this dataset."}
+            valid = ndvi["valid_mask"] & historical_ndvi["valid_mask"]
+            delta = np.full(ndvi["raster"].shape, np.nan, dtype=np.float32)
+            delta[valid] = ndvi["raster"][valid] - historical_ndvi["raster"][valid]
+            period_change = float(np.nanmean(delta[valid])) if np.any(valid) else None
+            spatial["period_change"] = {
+                "mean_ndvi_delta": period_change,
+                "change_pixels": int(np.count_nonzero(valid & (delta > 0.05))),
+                "reduction_pixels": int(np.count_nonzero(valid & (delta < -0.05))),
+                "valid_pixels": int(np.count_nonzero(valid)),
+                "status": "ok" if period_change is not None else "insufficient-data",
+            }
+        except DatasetError as exc:
+            spatial["period_change"] = {
+                "status": "insufficient-data",
+                "message": str(exc),
+            }
     else:
-        spatial["persistent_change"] = {"status": "insufficient-data", "message": "Historical observations are unavailable for persistent-change analysis."}
+        spatial["period_change"] = {
+            "status": "insufficient-data",
+            "message": "A paired-period comparison is unavailable because historical imagery is missing.",
+        }
     return spatial

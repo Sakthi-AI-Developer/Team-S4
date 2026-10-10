@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 from config import settings
-from satellite.base_provider import ProviderNotConfiguredError, SatelliteProvider
+from satellite.base_provider import (
+    ProviderCapabilityUnavailableError,
+    ProviderNotConfiguredError,
+    SatelliteProvider,
+)
 
 
 class LiveSatelliteProvider(SatelliteProvider):
@@ -16,14 +20,19 @@ class LiveSatelliteProvider(SatelliteProvider):
             return {
                 "provider": self.name,
                 "configured": False,
+                "available": False,
                 "mode": "live",
                 "message": "Live satellite provider credentials are not configured; Stage-A local data remains active.",
             }
         return {
             "provider": self.name,
             "configured": True,
+            "available": False,
             "mode": "live",
-            "message": "Live provider is configured and ready to search Sentinel-2 scenes.",
+            "message": (
+                "Provider credentials are present, but live scene search and download "
+                "are not implemented; no live results have been queried."
+            ),
         }
 
     def search(self, request, **kwargs) -> list[dict]:
@@ -31,14 +40,18 @@ class LiveSatelliteProvider(SatelliteProvider):
             raise ProviderNotConfiguredError(
                 "Live satellite provider credentials are not configured; local Stage-A mode remains available."
             )
-        return []
+        raise ProviderCapabilityUnavailableError(
+            "Live scene search is not implemented; no satellite-provider results were queried."
+        )
 
     def download(self, product_id: str, **kwargs) -> dict:
         if not self.configured:
             raise ProviderNotConfiguredError(
                 "Live satellite provider credentials are not configured; no live download is permitted."
             )
-        raise NotImplementedError("Real live downloads require provider configuration and authentication.")
+        raise ProviderCapabilityUnavailableError(
+            "Live satellite downloads are not implemented; no scene was downloaded."
+        )
 
     def list_products(self) -> list[dict]:
         return []

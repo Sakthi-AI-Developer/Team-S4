@@ -20,6 +20,20 @@ body { margin: 0; min-width: 350px; min-height: 100vh; background: #101719; }
 button, a { font: inherit; }
 button { color: inherit; }
 a { color: inherit; text-decoration: none; }
+.auth-shell { min-height: 100vh; display: grid; place-items: center; padding: 24px; color: #e5eceb; }
+.auth-card { width: min(100%, 420px); display: grid; gap: 12px; padding: 28px; border: 1px solid #2a393c; border-radius: 10px; background: #172124; }
+.auth-card .eyebrow { margin: 0; }
+.auth-card h1 { margin: 0; font-size: 22px; }
+.auth-card p { color: #aab9b6; font-size: 12px; line-height: 1.6; margin: 0; }
+.auth-card label { color: #cbd8d4; font-size: 11px; }
+.auth-card input { width: 100%; padding: 10px; border: 1px solid #344447; border-radius: 5px; color: #e5eceb; background: #101719; }
+.auth-card input:focus { outline: 2px solid #95cf9a; outline-offset: 1px; }
+.auth-card .auth-error { color: #e39b91; }
+.auth-card .auth-notice { color: #a8d0ad; }
+.auth-mode-button { padding: 7px; border: 0; color: #a8d0ad; background: transparent; font-size: 11px; cursor: pointer; }
+.auth-user-label { max-width: 210px; overflow: hidden; color: #aab9b6; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.auth-signout-button { padding: 6px 8px; border: 1px solid #344447; border-radius: 4px; color: #bac8c4; background: #202d30; font-size: 10px; cursor: pointer; }
+.auth-signout-button:disabled { opacity: .6; }
 .app-shell { min-height: 100vh; }
 .sidebar { width: 225px; position: fixed; inset: 0 auto 0 0; display: flex; flex-direction: column; padding: 25px 16px 18px; background: #131d20; border-right: 1px solid #263336; z-index: 500; }
 .brand { display: flex; align-items: center; gap: 10px; padding: 0 7px; font: 700 12px 'Space Grotesk', sans-serif; letter-spacing: .07em; }
@@ -122,6 +136,7 @@ h1 { font-size: 25px; letter-spacing: -.035em; margin: 0 0 7px; }
 .change-summary span { display: flex; justify-content: space-between; color: #929f9f; font-size: 9px; }
 .change-summary b { color: #dce6df; font: 10px var(--mono); }
 .result-select { max-width: 260px; padding: 7px 9px; border: 1px solid #334345; border-radius: 4px; color: #b8c7c2; background: #1b282b; font-size: 9px; }
+.result-controls { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 7px; }
 .about-panel > p { margin: 0; padding: 0 15px 10px; color: #aab7b2; font-size: 10px; line-height: 1.6; }
 .formula-list { display: grid; gap: 5px; padding: 0 15px 10px; }
 .formula-list span { padding: 7px 8px; border-radius: 4px; color: #a6b8ae; background: #202d2f; font: 9px var(--mono); }

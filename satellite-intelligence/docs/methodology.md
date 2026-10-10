@@ -28,6 +28,8 @@ The Stage A `LocalDataProvider` reads only `backend/data/current/` and `backend/
 
 Every combination of bands must have matching dimensions, CRS, and transform. Current and historical rasters must also be aligned to compare pixels. An incompatible input produces a useful validation error so the user can prepare aligned imagery explicitly.
 
+Raster metadata is preserved as provenance, including acquisition date, platform, sensor, provider/source, CRS, resolution and NoData quality where present. Conflicting tags are omitted with warnings. Missing values remain unknown; tags supplied by an uploaded file are not independently verified. Sample and mock rasters are explicitly tagged synthetic and do not receive a fabricated observation date or geographic footprint.
+
 ## Derived indices
 
 - **NDVI:** `(NIR - Red) / (NIR + Red)` using B08 and B04.
@@ -48,9 +50,13 @@ Division by zero is marked invalid rather than replaced by an invented value. St
 
 The priority order is significant. Class percentages are shares of valid pixels. Area is calculated only for projected CRSs with known conversion to square metres. “Baseline/heuristic confidence” is explicitly not a calibrated model probability; this baseline does not claim accuracy.
 
+The repository also contains an untrained Random Forest wrapper, but no training data, labels, fitted model artifact, or held-out test set is present. It is not the classifier used for dashboard land-cover outputs. Supervised classification accuracy cannot be established from this repository's current data.
+
 ## Historical change
 
 NDVI is calculated independently for current and historical bands. Per-pixel change is `current_NDVI - historical_NDVI`. A pixel is positive or negative when the valid difference is respectively above or below zero. Relative mean percentage change uses the absolute historical mean as denominator and is undefined when that mean is zero or unavailable. This is a descriptive image comparison and does not establish cause.
+
+This is a single paired-period comparison, not a repeated trend. Risk indicators use code-defined screening thresholds and report their evidence and limitations; they are not calibrated risk scores or causal diagnoses. Temporal summaries and linear forecasts require distinct acquisition-date tags in the raster metadata. Since local dates are unverified user-supplied tags and the folder layout holds only one current and one historical dataset, forecast/evaluation output must be interpreted as insufficient or exploratory rather than independently validated performance.
 
 ## Outputs and map
 
@@ -59,3 +65,5 @@ Each analysis receives a server-generated result identifier. Output folders cont
 ## Limitations and responsible interpretation
 
 Results depend on input calibration, acquisition conditions, cloud/shadow contamination, and temporal consistency. Land-cover rules and index thresholds are a hackathon baseline; they require local validation before operational decisions. Output percentages and summaries should be interpreted as satellite-derived indicators, not absolute real-world conclusions. Ground observations should be used where required.
+
+The spatial-analysis endpoint summarizes the full raster and rejects AOI input because clipping has not been implemented. A deterministic 4x4 synthetic example is available at `/api/geoai/demo`; it runs in memory, is explicitly labelled synthetic, has no coordinates or date, and does not create or modify user analysis records. The mock satellite provider also emits local-CRS synthetic rasters, never real scene metadata. Live satellite search/download, independent satellite metadata verification, validated supervised model metrics, and ground-truth evaluation remain unimplemented.

@@ -7,19 +7,21 @@ import numpy as np
 
 def evaluate_forecast(values: list[float] | np.ndarray, test_fraction: float = 0.25) -> dict[str, Any]:
     history = np.asarray(values, dtype=float)
-    if history.size < 3:
+    if not 0 < test_fraction < 1:
+        raise ValueError("test_fraction must be between 0 and 1.")
+    if history.size < 5 or not np.all(np.isfinite(history)):
         return {
             "status": "insufficient-data",
-            "message": "Forecast evaluation unavailable: insufficient historical observations.",
+            "message": "Forecast evaluation unavailable: at least five finite historical observations are required to leave two or more held-out values with the default split.",
             "metrics": {},
         }
     split_index = max(2, min(history.size - 1, int(len(history) * (1 - test_fraction))))
     train = history[:split_index]
     test = history[split_index:]
-    if test.size == 0:
+    if test.size < 2:
         return {
             "status": "insufficient-data",
-            "message": "Forecast evaluation unavailable: insufficient historical observations.",
+            "message": "Forecast evaluation unavailable: the chronological hold-out must contain at least two observations.",
             "metrics": {},
         }
     x = np.arange(train.size, dtype=float)

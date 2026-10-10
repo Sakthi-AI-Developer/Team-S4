@@ -8,6 +8,10 @@ class ProviderNotConfiguredError(RuntimeError):
     """Raised when a live provider is unavailable because credentials or setup are missing."""
 
 
+class ProviderCapabilityUnavailableError(RuntimeError):
+    """Raised when a configured provider does not yet implement a requested operation."""
+
+
 class SatelliteProvider(ABC):
     name = "provider"
 

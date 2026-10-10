@@ -1,34 +1,25 @@
 import { useState } from 'react';
-import { downloadResult } from '../services/api';
+import { downloadArtifact } from '../services/api';
 
-const FILES = [
-  ['ndvi', 'NDVI GeoTIFF'],
-  ['ndwi', 'NDWI GeoTIFF'],
-  ['ndbi', 'NDBI GeoTIFF'],
-  ['landcover', 'Land-use GeoTIFF'],
-  ['change_detection', 'Change GeoTIFF'],
-  ['report', 'Summary JSON'],
-];
-
-export default function DownloadPanel({ resultId, analyses, onError }) {
+export default function DownloadPanel({ resultId, artifacts, loading, error, onError }) {
   const [downloading, setDownloading] = useState('');
 
-  async function handleDownload(key, label, downloadId) {
-    if (!downloadId || downloading) return;
-    setDownloading(key);
+  async function handleDownload(artifact) {
+    if (!resultId || downloading) return;
+    setDownloading(artifact.artifact_name);
     try {
-      const response = await downloadResult(downloadId, key);
+      const response = await downloadArtifact(resultId, artifact.artifact_name);
       const blobUrl = URL.createObjectURL(response.data);
       const link = document.createElement('a');
       link.href = blobUrl;
-      link.download = key === 'report' ? 'summary.json' : `${key}.tif`;
+      link.download = artifact.artifact_name;
       document.body.appendChild(link);
       link.click();
       link.remove();
       URL.revokeObjectURL(blobUrl);
     } catch (error) {
       const detail = error.response?.data?.detail;
-      onError(typeof detail === 'string' ? detail : `Unable to download ${label}.`);
+      onError(typeof detail === 'string' ? detail : `Unable to download ${artifact.artifact_name}.`);
     } finally {
       setDownloading('');
     }
@@ -36,21 +27,25 @@ export default function DownloadPanel({ resultId, analyses, onError }) {
 
   return (
     <div className="download-panel-content">
-      <div className="download-list">
-        {FILES.map(([key, label]) => {
-          const analysisResultId = analyses[key]?.result_id || resultId;
-          const available = Boolean(analysisResultId && (key === 'report' || analyses[key]));
+      {loading && <p className="panel-note" role="status">Loading saved artifact metadata…</p>}
+      {error && <p className="panel-note" role="alert">{error}</p>}
+      {!loading && !error && !artifacts.length && (
+        <p className="panel-note">{resultId ? 'No persisted artifacts are available for this result.' : 'Run or load an analysis to see its saved files.'}</p>
+      )}
+      <div className="download-list" aria-label="Saved artifacts">
+        {artifacts.map((artifact) => {
+          const isDownloading = downloading === artifact.artifact_name;
           return (
             <button
-              className={`download-row ${available ? '' : 'disabled'}`}
+              className="download-row"
               type="button"
-              key={key}
-              disabled={!available || Boolean(downloading)}
-              onClick={() => handleDownload(key, label, analysisResultId)}
+              key={artifact.artifact_name}
+              disabled={!resultId || Boolean(downloading)}
+              onClick={() => handleDownload(artifact)}
             >
-              <span>{downloading === key ? '…' : '⇩'}</span>
-              <b>{downloading === key ? 'Downloading' : label}</b>
-              <small>{available ? 'Ready' : 'Unavailable'}</small>
+              <span>{isDownloading ? '…' : '⇩'}</span>
+              <b>{isDownloading ? 'Downloading' : artifact.artifact_name}</b>
+              <small>{artifact.artifact_type} · {artifact.size_bytes.toLocaleString()} bytes</small>
             </button>
           );
         })}

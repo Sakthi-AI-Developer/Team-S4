@@ -9,6 +9,7 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.57.4",
     "axios": "^1.8.4",
     "leaflet": "^1.9.4",
     "react": "^19.0.0",

@@ -4,6 +4,10 @@ from datetime import date
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pyproj import Geod
+from shapely.geometry import MultiPolygon, Polygon, shape
+from shapely.geometry.polygon import orient
+from shapely.validation import explain_validity
 
 
 class GeoJSONPolygon(BaseModel):
@@ -36,6 +40,14 @@ class GeoJSONPolygon(BaseModel):
                 if not (-180 <= lon <= 180 and -90 <= lat <= 90):
                     raise ValueError("AOI coordinates must fall within valid geographic bounds.")
 
+        try:
+            geometry = shape(self.model_dump())
+        except (TypeError, ValueError) as exc:
+            raise ValueError("AOI coordinates do not form a valid GeoJSON geometry.") from exc
+        if geometry.is_empty or not geometry.is_valid:
+            raise ValueError(
+                f"AOI geometry is invalid: {explain_validity(geometry)}."
+            )
         bbox = self.bounds
         width = abs(bbox[2] - bbox[0])
         height = abs(bbox[3] - bbox[1])
@@ -59,10 +71,19 @@ class GeoJSONPolygon(BaseModel):
         return [ring for polygon in self.coordinates for ring in polygon]
 
     def estimate_area_km2(self) -> float:
-        min_lon, min_lat, max_lon, max_lat = self.bounds
-        width_km = abs(max_lon - min_lon) * 111.32 * max(abs(min_lat), abs(max_lat)) / 90
-        height_km = abs(max_lat - min_lat) * 111.32
-        return max(width_km * height_km, 0.0)
+        geometry = shape(self.model_dump())
+        polygons = (
+            list(geometry.geoms)
+            if isinstance(geometry, MultiPolygon)
+            else [geometry]
+        )
+        geod = Geod(ellps="WGS84")
+        area_square_metres = sum(
+            abs(geod.geometry_area_perimeter(orient(polygon, sign=1.0))[0])
+            for polygon in polygons
+            if isinstance(polygon, Polygon)
+        )
+        return area_square_metres / 1_000_000
 
 
 class SatelliteSearchRequest(BaseModel):
@@ -91,7 +112,7 @@ class SatelliteDownloadRequest(BaseModel):
 
 class SatelliteProduct(BaseModel):
     product_id: str
-    acquisition_date: str
+    acquisition_date: str | None = None
     cloud_cover: float | None = None
     platform: str
     processing_level: str | None = None

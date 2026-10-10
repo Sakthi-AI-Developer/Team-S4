@@ -1,18 +1,35 @@
 import json
+import hashlib
+import heapq
+import logging
+import mimetypes
 import os
 import re
 import tempfile
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import BoundedSemaphore
+from time import monotonic
+from typing import Any
+from urllib.parse import quote
 from uuid import uuid4
 
 import numpy as np
 import rasterio
-from fastapi import APIRouter, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from rasterio._err import CPLE_BaseError
+from rasterio.crs import CRS
+from rasterio.errors import RasterioError
+from rasterio.transform import Affine, array_bounds
 from rasterio.warp import transform_bounds
+from fastapi import APIRouter, Depends, File, Header, HTTPException, Query, UploadFile
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from config import settings, validate_runtime_settings
+from auth import AuthenticatedUser, authenticated_user_id, current_user
+from persistence.artifacts import ArtifactStorageError
+from persistence.manager import PersistenceManager
 from models.landcover_model import LandCoverModel
 from processing.change_detection import calculate_change
 from processing.data_provider import LocalDataProvider
@@ -22,12 +39,15 @@ from processing.ndvi import calculate_ndvi
 from processing.ndwi import calculate_ndwi
 from processing.preprocessing import (
     DatasetError,
+    RasterBand,
     SatelliteDataset,
     build_profile,
     identify_band,
+    load_dataset,
     pixel_area_square_metres,
     raster_metadata,
 )
+from processing.provenance import analysis_provenance, dataset_provenance
 from processing.visualization import save_class_png, save_index_png, save_rgb_preview
 from geoai import (
     analyze_land_cover_transitions,
@@ -36,17 +56,23 @@ from geoai import (
     forecast_vegetation_trends,
     summarize_observation_history,
     summarize_spatial_patterns,
-    summarize_uncertainty,
 )
 from geoai.schemas import SpatialAnalysisRequest, TransitionRequest, VegetationForecastRequest
-from satellite.base_provider import ProviderNotConfiguredError
+from satellite.base_provider import (
+    ProviderCapabilityUnavailableError,
+    ProviderNotConfiguredError,
+)
 from satellite.cache import CacheManager
 from satellite.local_provider import LocalSatelliteProvider
 from satellite.live_provider import LiveSatelliteProvider
 from satellite.mock_provider import MockSatelliteProvider
 from satellite.models import SatelliteDownloadRequest, SatelliteSearchRequest
+from geoai.trend_models import _parse_date
 
 router = APIRouter()
+logger = logging.getLogger("satellite-intelligence")
+persistence_manager = PersistenceManager(settings)
+analysis_slots = BoundedSemaphore(settings.max_concurrent_analyses)
 ANALYSES = ("ndvi", "ndwi", "ndbi", "landcover", "change_detection")
 ANALYSIS_ALIASES = {"change": "change_detection"}
 DOWNLOAD_FILES = {
@@ -69,28 +95,114 @@ REQUIRED_BANDS = {
 }
 SUPPORTED_BANDS = ("B02", "B03", "B04", "B08", "B11")
 DATASET_PERIODS = {"current", "historical"}
+DEFAULT_RESULTS_PAGE_SIZE = 50
+MAX_RESULTS_PAGE_SIZE = 100
 cache_manager = CacheManager(settings.satellite_cache_dir)
+_analysis_deadline: ContextVar[float | None] = ContextVar(
+    "analysis_deadline",
+    default=None,
+)
 
 
-def _provider_for_mode():
+def _check_analysis_deadline() -> None:
+    deadline = _analysis_deadline.get()
+    if deadline is not None and monotonic() >= deadline:
+        raise HTTPException(
+            status_code=504,
+            detail="Analysis exceeded its configured processing time limit.",
+        )
+
+
+@contextmanager
+def _analysis_slot():
+    if not analysis_slots.acquire(blocking=False):
+        raise HTTPException(
+            status_code=503,
+            detail="Analysis capacity is busy. Retry the request shortly.",
+            headers={"Retry-After": "1"},
+        )
+    deadline_token = _analysis_deadline.set(
+        monotonic() + settings.max_analysis_seconds
+    )
+    try:
+        yield
+    finally:
+        _analysis_deadline.reset(deadline_token)
+        analysis_slots.release()
+
+
+def _request_dataset_root() -> Path:
+    if not settings.authentication_required:
+        return settings.data_dir.resolve()
+    user_id = authenticated_user_id.get()
+    if not user_id:
+        raise HTTPException(
+            status_code=401,
+            detail="A valid Supabase sign-in is required.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    namespace = hashlib.sha256(user_id.encode("utf-8")).hexdigest()
+    root = (settings.data_dir / "users" / namespace).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    for period in DATASET_PERIODS:
+        (root / period).mkdir(exist_ok=True)
+    return root
+
+
+def _request_cache_manager() -> CacheManager:
+    if not settings.authentication_required:
+        return cache_manager
+    data_root = _request_dataset_root()
+    return CacheManager(settings.satellite_cache_dir / "users" / data_root.name)
+
+
+def _provider_for_mode(cache: CacheManager | None = None):
     provider_name = (settings.satellite_provider or "local").lower()
     if provider_name == "mock":
-        return MockSatelliteProvider(cache_manager)
+        return MockSatelliteProvider(cache or _request_cache_manager())
     if provider_name == "live":
         return LiveSatelliteProvider()
     return LocalSatelliteProvider()
 
 
-def _dataset(directory: Path, required: tuple[str, ...] = ()) -> SatelliteDataset:
+def _dataset(
+    directory: Path,
+    required: tuple[str, ...] = (),
+    *,
+    include_other_bands: bool = True,
+) -> SatelliteDataset:
     try:
-        period = directory.resolve().relative_to(settings.data_dir.resolve()).as_posix()
+        relative_path = directory.resolve().relative_to(settings.data_dir.resolve())
     except ValueError as exc:
         raise DatasetError("Requested dataset directory is outside the configured data root.") from exc
-    return data_provider.load(period, required)
+    if settings.authentication_required:
+        data_root = _request_dataset_root()
+        scoped_directory = (data_root / relative_path).resolve()
+        if data_root not in scoped_directory.parents:
+            raise DatasetError("Requested dataset directory is outside the authenticated user's data root.")
+        return load_dataset(
+            scoped_directory,
+            required,
+            include_other_bands=include_other_bands,
+            max_pixels=settings.max_raster_pixels,
+            max_file_bytes=settings.max_raster_bytes,
+            max_input_array_bytes=settings.max_input_array_bytes,
+            deadline_check=_check_analysis_deadline,
+        )
+    return data_provider.load(
+        relative_path.as_posix(),
+        required,
+        include_other_bands=include_other_bands,
+        max_pixels=settings.max_raster_pixels,
+        max_file_bytes=settings.max_raster_bytes,
+        max_input_array_bytes=settings.max_input_array_bytes,
+        deadline_check=_check_analysis_deadline,
+    )
 
 
-def _public_dataset(dataset: SatelliteDataset) -> dict:
+def _public_dataset(dataset: SatelliteDataset, dataset_id: str) -> dict:
     reference = next(iter(dataset.bands.values()), None)
+    band_codes = tuple(code for code in SUPPORTED_BANDS if code in dataset.bands)
     return {
         "available": bool(dataset.bands),
         "bands": [
@@ -115,6 +227,7 @@ def _public_dataset(dataset: SatelliteDataset) -> dict:
         "errors": dataset.errors,
         "bounds": _bounds(reference) if reference else None,
         "metadata": raster_metadata(reference),
+        "provenance": dataset_provenance(dataset_id, dataset, band_codes),
     }
 
 
@@ -129,12 +242,17 @@ def _data_quality_summary(dataset: SatelliteDataset) -> dict:
         }
     reference = next(iter(dataset.bands.values()))
     valid_pixels = 0
-    total_pixels = reference.width * reference.height
-    nodata_pixels = 0
+    total_band_pixels = 0
+    invalid_band_pixels = 0
     for band in dataset.bands.values():
         valid_pixels += int(np.count_nonzero(band.valid))
-        nodata_pixels += int(np.count_nonzero(~band.valid))
-    nodata_percentage = (nodata_pixels / max(total_pixels, 1)) * 100 if total_pixels else 0.0
+        total_band_pixels += int(band.valid.size)
+        invalid_band_pixels += int(np.count_nonzero(~band.valid))
+    nodata_percentage = (
+        invalid_band_pixels / total_band_pixels * 100
+        if total_band_pixels
+        else 100.0
+    )
     warnings = []
     if dataset.missing_bands:
         warnings.append(f"Missing required bands: {', '.join(dataset.missing_bands)}")
@@ -142,6 +260,12 @@ def _data_quality_summary(dataset: SatelliteDataset) -> dict:
         warnings.append("A large share of pixels is nodata or invalid.")
     if reference.crs is None:
         warnings.append("Raster CRS is missing; geospatial interpretation is limited.")
+    try:
+        from processing.preprocessing import validate_alignment
+
+        validate_alignment(dataset.bands.values())
+    except DatasetError as exc:
+        warnings.append(f"Available bands are not on a verified common grid: {exc}")
     try:
         historical_available = bool(_dataset(settings.data_dir / "historical").bands)
     except DatasetError:
@@ -154,6 +278,9 @@ def _data_quality_summary(dataset: SatelliteDataset) -> dict:
         "width": reference.width,
         "height": reference.height,
         "resolution": list(reference.resolution),
+        "valid_band_pixels": valid_pixels,
+        "total_band_pixels": total_band_pixels,
+        "nodata_percentage_method": "invalid band-pixels divided by all available band-pixels",
         "historical_available": historical_available,
         "warnings": warnings,
     }
@@ -162,16 +289,76 @@ def _data_quality_summary(dataset: SatelliteDataset) -> dict:
 def _bounds(reference) -> list[float] | None:
     if not reference or not reference.crs:
         return None
-    bounds = rasterio.transform.array_bounds(
-        reference.height, reference.width, reference.transform
-    )
-    if reference.crs != "EPSG:4326":
-        bounds = transform_bounds(reference.crs, "EPSG:4326", *bounds, densify_pts=21)
-    west, south, east, north = bounds
-    return [west, south, east, north]
+    try:
+        bounds = array_bounds(reference.height, reference.width, reference.transform)
+        if reference.crs != "EPSG:4326":
+            crs = CRS.from_string(reference.crs)
+            if not (crs.is_geographic or crs.is_projected):
+                return None
+            bounds = transform_bounds(
+                reference.crs, "EPSG:4326", *bounds, densify_pts=21
+            )
+    except (CPLE_BaseError, RasterioError, ValueError):
+        return None
+    if not np.all(np.isfinite(bounds)):
+        return None
+    return [float(value) for value in bounds]
 
 
-def _json_safe(value):
+def _dated_ndvi_observations(
+    dataset_ids: tuple[str, ...] = ("current", "historical"),
+) -> tuple[list[dict[str, Any]], list[str]]:
+    observations: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    seen_dates: set[str] = set()
+    for dataset_id in dataset_ids:
+        try:
+            dataset = _check_dataset(settings.data_dir / dataset_id, "ndvi")
+        except DatasetError as exc:
+            warnings.append(f"{dataset_id}: {exc}")
+            continue
+        provenance = dataset_provenance(
+            dataset_id, dataset, REQUIRED_BANDS["ndvi"]
+        )
+        if provenance["data_classification"] == "synthetic":
+            warnings.append(
+                f"{dataset_id}: synthetic fixture; it is not a satellite observation."
+            )
+        else:
+            warnings.append(
+                f"{dataset_id}: acquisition metadata is user-provided and has not been independently verified."
+            )
+        parsed_date = _parse_date(provenance.get("acquisition_date"))
+        if parsed_date is None:
+            warnings.append(
+                f"{dataset_id}: no valid acquisition date in raster metadata; excluded from temporal analysis."
+            )
+            continue
+        observation_date = parsed_date.date().isoformat()
+        if observation_date in seen_dates:
+            warnings.append(
+                f"{dataset_id}: duplicate acquisition date {observation_date}; excluded from temporal analysis."
+            )
+            continue
+        ndvi = calculate_ndvi(dataset.bands["B04"], dataset.bands["B08"])
+        valid_values = ndvi["raster"][ndvi["valid_mask"]]
+        if valid_values.size == 0:
+            warnings.append(f"{dataset_id}: no valid NDVI pixels; excluded from temporal analysis.")
+            continue
+        seen_dates.add(observation_date)
+        observations.append(
+            {
+                "date": observation_date,
+                "mean_ndvi": float(np.mean(valid_values)),
+                "dataset_id": dataset_id,
+                "provenance": provenance,
+            }
+        )
+    observations.sort(key=lambda item: item["date"])
+    return observations, warnings
+
+
+def _json_safe(value: Any) -> Any:
     if isinstance(value, dict):
         return {key: _json_safe(item) for key, item in value.items() if key not in {"raster", "valid_mask", "reference"}}
     if isinstance(value, (list, tuple)):
@@ -231,20 +418,37 @@ def _single_result(result_dir: Path, key: str, dataset: SatelliteDataset) -> dic
             if pixel_area is not None and data["vegetation_percentage"] is not None
             else None
         )
-        return _save_analysis(result_dir, key, data, "NDVI", "ndvi")
-    if key == "ndwi":
-        return _save_analysis(result_dir, key, calculate_ndwi(bands["B03"], bands["B08"]), "NDWI", "ndwi")
-    if key == "ndbi":
-        return _save_analysis(result_dir, key, calculate_ndbi(bands["B08"], bands["B11"]), "NDBI", "ndbi")
-    if key == "landcover":
-        return _save_analysis(
+        result = _save_analysis(result_dir, key, data, "NDVI", "ndvi")
+    elif key == "ndwi":
+        result = _save_analysis(
+            result_dir,
+            key,
+            calculate_ndwi(bands["B03"], bands["B08"]),
+            "NDWI",
+            "ndwi",
+        )
+    elif key == "ndbi":
+        result = _save_analysis(
+            result_dir,
+            key,
+            calculate_ndbi(bands["B08"], bands["B11"]),
+            "NDBI",
+            "ndbi",
+        )
+    elif key == "landcover":
+        result = _save_analysis(
             result_dir,
             key,
             LandCoverClassifier().classify(bands),
             "Land-use / land-cover",
             classes=True,
         )
-    raise DatasetError(f"Unsupported analysis: {key}.")
+    else:
+        raise DatasetError(f"Unsupported analysis: {key}.")
+    result["provenance"] = analysis_provenance(
+        key, {"current": (dataset, REQUIRED_BANDS[key])}
+    )
+    return result
 
 
 def _validate_dataset(dataset: SatelliteDataset, key: str) -> SatelliteDataset:
@@ -268,8 +472,16 @@ def _validate_upload_alignment(upload_path: Path, dataset_dir: Path) -> None:
                     continue
                 if identify_band(existing_path.name) is None:
                     continue
+                if existing_path.stat().st_size > settings.max_raster_bytes:
+                    raise DatasetError(
+                        f"{existing_path.name} exceeds the configured raster file limit."
+                    )
                 try:
                     with rasterio.open(existing_path) as existing:
+                        if existing.width * existing.height > settings.max_raster_pixels:
+                            raise DatasetError(
+                                f"{existing_path.name} exceeds the configured raster pixel limit."
+                            )
                         if (uploaded.width, uploaded.height) != (existing.width, existing.height):
                             raise DatasetError(
                                 f"The uploaded raster dimensions differ from {existing_path.name}; "
@@ -292,16 +504,20 @@ def _validate_upload_alignment(upload_path: Path, dataset_dir: Path) -> None:
                             )
                 except DatasetError:
                     raise
-                except rasterio.errors.RasterioError:
+                except RasterioError:
                     continue
     except DatasetError:
         raise
-    except (rasterio.errors.RasterioError, OSError) as exc:
+    except (RasterioError, OSError) as exc:
         raise DatasetError("The uploaded file is not a readable GeoTIFF.") from exc
 
 
 @router.post("/dataset/{period}/upload", status_code=201)
-async def upload_dataset_band(period: str, file: UploadFile = File(...)) -> dict:
+async def upload_dataset_band(
+    period: str,
+    file: UploadFile = File(...),
+    user: AuthenticatedUser | None = Depends(current_user),
+) -> dict:
     if period not in DATASET_PERIODS:
         raise HTTPException(status_code=404, detail="Dataset period must be current or historical.")
     if Path(file.filename or "").suffix.lower() not in {".tif", ".tiff"}:
@@ -313,8 +529,9 @@ async def upload_dataset_band(period: str, file: UploadFile = File(...)) -> dict
             detail="Filename must identify one Sentinel-2 band: B02, B03, B04, B08, or B11.",
         )
 
-    dataset_dir = (settings.data_dir / period).resolve()
-    if dataset_dir.parent != settings.data_dir.resolve():
+    dataset_root = _request_dataset_root()
+    dataset_dir = (dataset_root / period).resolve()
+    if dataset_dir.parent != dataset_root.resolve():
         raise HTTPException(status_code=400, detail="Invalid dataset destination.")
     dataset_dir.mkdir(parents=True, exist_ok=True)
     destination = dataset_dir / f"{band_code}.tif"
@@ -342,6 +559,11 @@ async def upload_dataset_band(period: str, file: UploadFile = File(...)) -> dict
                         status_code=413,
                         detail=f"File exceeds the {settings.max_upload_bytes // (1024 * 1024)} MB upload limit.",
                     )
+                if total_bytes > settings.max_raster_bytes:
+                    raise HTTPException(
+                        status_code=413,
+                        detail="File exceeds the configured raster file-size limit.",
+                    )
                 temporary.write(chunk)
         if total_bytes == 0:
             raise HTTPException(status_code=422, detail="The uploaded GeoTIFF is empty.")
@@ -352,6 +574,15 @@ async def upload_dataset_band(period: str, file: UploadFile = File(...)) -> dict
                     raise DatasetError("Each uploaded GeoTIFF must contain exactly one band.")
                 if source.crs is None:
                     raise DatasetError("The uploaded GeoTIFF has no CRS; add georeferenced imagery.")
+                pixel_count = source.width * source.height
+                if pixel_count > settings.max_raster_pixels:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            f"GeoTIFF has {pixel_count} pixels; the configured limit is "
+                            f"{settings.max_raster_pixels} pixels per raster."
+                        ),
+                    )
                 has_valid_pixel = False
                 for _, window in source.block_windows(1):
                     block = source.read(1, window=window, masked=True)
@@ -362,7 +593,7 @@ async def upload_dataset_band(period: str, file: UploadFile = File(...)) -> dict
                     raise DatasetError("The uploaded GeoTIFF contains no valid pixels.")
         except DatasetError:
             raise
-        except (rasterio.errors.RasterioError, OSError, ValueError) as exc:
+        except (RasterioError, OSError, ValueError) as exc:
             raise DatasetError("The uploaded file is corrupt or is not a readable GeoTIFF.") from exc
 
         _validate_upload_alignment(temp_path, dataset_dir)
@@ -390,7 +621,14 @@ async def upload_dataset_band(period: str, file: UploadFile = File(...)) -> dict
 
 
 def _check_dataset(directory: Path, key: str) -> SatelliteDataset:
-    return _validate_dataset(_dataset(directory, REQUIRED_BANDS[key]), key)
+    return _validate_dataset(
+        _dataset(
+            directory,
+            REQUIRED_BANDS[key],
+            include_other_bands=False,
+        ),
+        key,
+    )
 
 
 def _historical_analysis(
@@ -420,38 +658,207 @@ def _historical_analysis(
         if pixel_area is not None and changed_pct is not None
         else None
     )
-    return _save_analysis(result_dir, "change_detection", data, "Historical change detection", "change")
+    result = _save_analysis(
+        result_dir, "change_detection", data, "Historical change detection", "change"
+    )
+    result["provenance"] = analysis_provenance(
+        "change_detection",
+        {
+            "current": (current, REQUIRED_BANDS["ndvi"]),
+            "historical": (historical, REQUIRED_BANDS["ndvi"]),
+        },
+    )
+    return result
 
 
-def _store_result(result_id: str, directory: Path, response: dict) -> None:
+def _store_result(result_id: str, directory: Path, response: dict, job_id: str) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     serializable = _json_safe(response)
     (directory / "summary.json").write_text(json.dumps(serializable, indent=2), encoding="utf-8")
+    try:
+        persistence_manager.persist_result(result_id, job_id, serializable, directory)
+    except ArtifactStorageError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Analysis outputs could not be persisted: {exc} "
+                "Local outputs have been retained for recovery."
+            ),
+            headers={"X-Processing-Job-ID": job_id},
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Analysis outputs could not be persisted because metadata storage failed. "
+                "Local outputs have been retained for recovery."
+            ),
+            headers={"X-Processing-Job-ID": job_id},
+        ) from exc
 
 
-def _run_analysis(key: str) -> dict:
+def _validate_idempotency_key(value: str | None) -> str | None:
+    if value is not None and not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", value):
+        raise HTTPException(
+            status_code=400,
+            detail="Idempotency-Key must contain 16-128 safe ASCII characters.",
+        )
+    return value
+
+
+def _existing_analysis_response(
+    analysis_id: str,
+    job_id: str,
+    analysis: str,
+    input_parameters: dict[str, Any],
+    owner_id: str | None,
+) -> dict:
+    record = persistence_manager.get_analysis(analysis_id, owner_id)
+    job = persistence_manager.get_job(job_id, owner_id)
+    if record is None or job is None:
+        raise HTTPException(
+            status_code=409,
+            detail="The matching analysis request is already registered.",
+            headers={"X-Processing-Job-ID": job_id},
+        )
+    if (
+        record["analysis"] != analysis
+        or record["input_parameters"] != input_parameters
+        or job["input_parameters"] != input_parameters
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Idempotency-Key was already used for a different analysis request.",
+            headers={"X-Processing-Job-ID": job_id},
+        )
+    if job["status"] == "completed" and isinstance(record["summary"], dict):
+        return record["summary"]
+    if job["status"] in {"queued", "running"}:
+        detail = "The matching analysis request is still processing."
+    else:
+        detail = "The matching analysis request failed; use a new Idempotency-Key to retry."
+    raise HTTPException(
+        status_code=409,
+        detail=detail,
+        headers={"X-Processing-Job-ID": job_id},
+    )
+
+
+def _run_analysis(
+    key: str,
+    owner_id: str | None = None,
+    idempotency_key: str | None = None,
+) -> dict:
     key = ANALYSIS_ALIASES.get(key, key)
     if key not in ANALYSES:
         raise HTTPException(status_code=404, detail="The requested analysis is not available.")
     result_id = uuid4().hex
+    input_parameters = {
+        "analysis_key": key,
+        "dataset_ids": ["current", "historical"] if key == "change_detection" else ["current"],
+    }
+    job_start = persistence_manager.start_job(
+        result_id,
+        key,
+        input_parameters,
+        owner_id=owner_id,
+        idempotency_key=idempotency_key,
+    )
+    result_id, job_id = job_start.analysis_id, job_start.job_id
+    if not job_start.created:
+        return _existing_analysis_response(
+            result_id, job_id, key, input_parameters, owner_id
+        )
     result_dir = settings.output_dir / result_id
     try:
+        _check_analysis_deadline()
         if key == "change_detection":
             analysis = _historical_analysis(result_dir)
         else:
             dataset = _check_dataset(settings.data_dir / "current", key)
             analysis = _single_result(result_dir, key, dataset)
+        _check_analysis_deadline()
+        summary = {
+            "success": True,
+            "id": result_id,
+            "job_id": job_id,
+            "analysis": analysis["analysis"],
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "result": analysis,
+        }
+        _store_result(result_id, result_dir, summary, job_id)
+        logger.info(
+            "Analysis job completed.",
+            extra={
+                "event": "analysis.job_completed",
+                "job_id": job_id,
+                "analysis": key,
+            },
+        )
+        return summary
     except DatasetError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    summary = {
-        "success": True,
-        "id": result_id,
-        "analysis": analysis["analysis"],
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "result": analysis,
-    }
-    _store_result(result_id, result_dir, summary)
-    return summary
+        try:
+            persistence_manager.fail_job(job_id, str(exc))
+        except Exception as state_error:
+            logger.error(
+                "Failed to persist analysis job failure state.",
+                extra={
+                    "event": "analysis.job_state_update_failed",
+                    "job_id": job_id,
+                    "analysis": key,
+                    "error_type": type(state_error).__name__,
+                },
+            )
+        logger.warning(
+            "Analysis job failed validation.",
+            extra={
+                "event": "analysis.job_failed",
+                "job_id": job_id,
+                "analysis": key,
+                "error_type": type(exc).__name__,
+            },
+        )
+        raise HTTPException(
+            status_code=422,
+            detail=str(exc),
+            headers={"X-Processing-Job-ID": job_id},
+        ) from exc
+    except Exception as exc:
+        safe_detail = (
+            exc.detail
+            if isinstance(exc, HTTPException) and isinstance(exc.detail, str)
+            else "Analysis processing failed."
+        )
+        try:
+            persistence_manager.fail_job(job_id, safe_detail)
+        except Exception as state_error:
+            logger.error(
+                "Failed to persist analysis job failure state.",
+                extra={
+                    "event": "analysis.job_state_update_failed",
+                    "job_id": job_id,
+                    "analysis": key,
+                    "error_type": type(state_error).__name__,
+                },
+            )
+        logger.error(
+            "Analysis job failed.",
+            extra={
+                "event": "analysis.job_failed",
+                "job_id": job_id,
+                "analysis": key,
+                "error_type": type(exc).__name__,
+            },
+        )
+        if isinstance(exc, HTTPException) and exc.status_code == 504:
+            headers = dict(exc.headers or {})
+            headers.setdefault("X-Processing-Job-ID", job_id)
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail=exc.detail,
+                headers=headers,
+            ) from exc
+        raise
 
 
 def _result_directory(result_id: str) -> Path:
@@ -468,28 +875,72 @@ def health() -> dict:
     return {
         "status": "ok",
         "service": "satellite-intelligence-api",
-        "stage": "A",
-        "provider": _provider_for_mode().name,
-        "configured": _provider_for_mode().configured,
     }
+
+
+@router.get("/persistence/status")
+def persistence_status() -> dict:
+    return persistence_manager.status()
+
+
+@router.get("/auth/status")
+def authentication_status() -> dict:
+    return {
+        "authentication_required": settings.authentication_required,
+        "supabase_auth_configured": bool(settings.supabase_url and settings.supabase_anon_key),
+    }
+
+
+def _validated_id(value: str) -> str:
+    if not re.fullmatch(r"[0-9a-f]{32}", value):
+        raise HTTPException(status_code=404, detail="Record was not found.")
+    return value
+
+
+@router.get("/analyses/{analysis_id}")
+def get_analysis_record(
+    analysis_id: str,
+    user: AuthenticatedUser | None = Depends(current_user),
+) -> dict:
+    analysis_id = _validated_id(analysis_id)
+    record = persistence_manager.get_analysis(analysis_id, user.id if user else None)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Analysis metadata is unavailable.")
+    return record
+
+
+@router.get("/jobs/{job_id}")
+def get_processing_job(
+    job_id: str,
+    user: AuthenticatedUser | None = Depends(current_user),
+) -> dict:
+    job_id = _validated_id(job_id)
+    record = persistence_manager.get_job(job_id, user.id if user else None)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Processing job is unavailable.")
+    return record
 
 
 @router.get("/ready")
-def ready() -> dict:
-    issues = validate_runtime_settings()
-    return {
-        "status": "ok" if not issues else "degraded",
-        "checks": {"configuration": issues},
+def ready() -> JSONResponse:
+    report = persistence_manager.readiness(validate_runtime_settings())
+    return JSONResponse(
+        status_code=200 if report["status"] == "ok" else 503,
+        content={
+            **report,
         "service": "satellite-intelligence-api",
         "stage": "A",
-    }
+        },
+    )
 
 
 @router.get("/dataset")
 def dataset_status() -> dict:
     try:
-        current = _public_dataset(_dataset(settings.data_dir / "current"))
-        historical = _public_dataset(_dataset(settings.data_dir / "historical"))
+        current = _public_dataset(_dataset(settings.data_dir / "current"), "current")
+        historical = _public_dataset(
+            _dataset(settings.data_dir / "historical"), "historical"
+        )
     except DatasetError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     provider = _provider_for_mode()
@@ -517,18 +968,25 @@ def satellite_search(request: SatelliteSearchRequest) -> dict:
         results = provider.search(request)
     except ProviderNotConfiguredError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except ProviderCapabilityUnavailableError as exc:
+        raise HTTPException(status_code=501, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"success": True, "provider": provider.name, "results": results}
 
 
 @router.post("/satellite/download")
-def satellite_download(request: SatelliteDownloadRequest) -> dict:
+def satellite_download(
+    request: SatelliteDownloadRequest,
+    user: AuthenticatedUser | None = Depends(current_user),
+) -> dict:
     provider = _provider_for_mode()
     try:
         result = provider.download(request.product_id, aoi=request.aoi)
     except ProviderNotConfiguredError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except ProviderCapabilityUnavailableError as exc:
+        raise HTTPException(status_code=501, detail=str(exc)) from exc
     except (KeyError, ValueError) as exc:
         raise HTTPException(status_code=404 if isinstance(exc, KeyError) else 400, detail=str(exc)) from exc
     return {"success": True, "provider": provider.name, "download": result}
@@ -551,13 +1009,17 @@ def satellite_product(product_id: str) -> dict:
 
 @router.get("/satellite/cache")
 def satellite_cache() -> dict:
-    return {"success": True, "provider": _provider_for_mode().name, "results": cache_manager.list_products()}
+    return {
+        "success": True,
+        "provider": _provider_for_mode().name,
+        "results": _request_cache_manager().list_products(),
+    }
 
 
 @router.delete("/satellite/cache/{product_id}")
 def clear_satellite_cache(product_id: str) -> dict:
     try:
-        deleted = cache_manager.delete_product(product_id)
+        deleted = _request_cache_manager().delete_product(product_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"success": True, "deleted": deleted, "product_id": product_id}
@@ -576,11 +1038,17 @@ def metadata() -> dict:
             "available": bool(current.bands),
             "metadata": raster_metadata(next(iter(current.bands.values()), None)),
             "bands": list(current.bands.keys()),
+            "provenance": dataset_provenance(
+                "current", current, tuple(current.bands.keys())
+            ),
         },
         "historical": {
             "available": bool(historical.bands),
             "metadata": raster_metadata(next(iter(historical.bands.values()), None)),
             "bands": list(historical.bands.keys()),
+            "provenance": dataset_provenance(
+                "historical", historical, tuple(historical.bands.keys())
+            ),
         },
     }
 
@@ -588,7 +1056,7 @@ def metadata() -> dict:
 @router.get("/data-quality")
 def data_quality() -> dict:
     try:
-        current = _dataset(settings.data_dir / "current")
+        current = _dataset(settings.data_dir / "current", SUPPORTED_BANDS)
     except DatasetError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return {
@@ -623,6 +1091,7 @@ def geoai_status() -> dict:
         ],
         "endpoints": [
             "/api/geoai/status",
+            "/api/geoai/demo",
             "/api/geoai/spatial-analysis",
             "/api/geoai/vegetation-forecast",
             "/api/geoai/land-cover-transitions",
@@ -633,38 +1102,199 @@ def geoai_status() -> dict:
     }
 
 
+@router.get("/geoai/demo")
+def geoai_demo_scenario(
+    user: AuthenticatedUser | None = Depends(current_user),
+) -> dict:
+    del user
+    synthetic_wkt = (
+        'LOCAL_CS["Synthetic demo grid",'
+        'LOCAL_DATUM["Synthetic local datum",0],UNIT["metre",1],'
+        "AXIS[\"Easting\",EAST],AXIS[\"Northing\",NORTH]]"
+    )
+    reflectance = {
+        "B02": np.full((4, 4), 0.1, dtype=np.float32),
+        "B03": np.array(
+            [
+                [0.4, 0.2, 0.1, 0.3],
+                [0.4, 0.2, 0.1, 0.3],
+                [0.3, 0.4, 0.2, 0.1],
+                [0.3, 0.4, 0.2, 0.1],
+            ],
+            dtype=np.float32,
+        ),
+        "B04": np.array(
+            [
+                [0.1, 0.3, 0.2, 0.4],
+                [0.1, 0.3, 0.2, 0.4],
+                [0.2, 0.1, 0.3, 0.4],
+                [0.2, 0.1, 0.3, 0.4],
+            ],
+            dtype=np.float32,
+        ),
+        "B08": np.array(
+            [
+                [0.6, 0.4, 0.3, 0.4],
+                [0.6, 0.4, 0.3, 0.4],
+                [0.3, 0.6, 0.4, 0.5],
+                [0.3, 0.6, 0.4, 0.5],
+            ],
+            dtype=np.float32,
+        ),
+        "B11": np.array(
+            [
+                [0.2, 0.6, 0.7, 0.2],
+                [0.2, 0.6, 0.7, 0.2],
+                [0.7, 0.2, 0.6, 0.5],
+                [0.7, 0.2, 0.6, 0.5],
+            ],
+            dtype=np.float32,
+        ),
+    }
+    valid = np.ones((4, 4), dtype=bool)
+    bands = {
+        code: RasterBand(
+            code=code,
+            data=values,
+            valid=valid.copy(),
+            profile={"nodata": None},
+            crs=synthetic_wkt,
+            transform=Affine.identity(),
+            width=4,
+            height=4,
+            resolution=(1.0, 1.0),
+            tags={
+                "SATELLITE_VISION_DATA_KIND": "synthetic",
+                "SOURCE": "deterministic in-memory hackathon demo fixture",
+            },
+        )
+        for code, values in reflectance.items()
+    }
+    dataset = SatelliteDataset(
+        directory=Path("synthetic-demo-fixture"),
+        bands=bands,
+        missing_bands=[],
+    )
+    raw_results = {
+        "ndvi": calculate_ndvi(bands["B04"], bands["B08"]),
+        "ndwi": calculate_ndwi(bands["B03"], bands["B08"]),
+        "ndbi": calculate_ndbi(bands["B08"], bands["B11"]),
+        "landcover": LandCoverClassifier().classify(bands),
+    }
+    return {
+        "success": True,
+        "scenario_id": "synthetic-index-baseline-v1",
+        "data_classification": "synthetic",
+        "source": "deterministic in-memory synthetic fixture",
+        "acquisition_date": None,
+        "geographic_coverage": None,
+        "sensor": None,
+        "message": (
+            "This reproducible 4x4 example is synthetic, not satellite imagery. "
+            "It has no acquisition date, real-world coordinates, or validated reflectance."
+        ),
+        "results": {
+            key: _json_safe(result) for key, result in raw_results.items()
+        },
+        "provenance": {
+            key: analysis_provenance(
+                key, {"synthetic_demo": (dataset, REQUIRED_BANDS[key])}
+            )
+            for key in raw_results
+        },
+    }
+
+
 @router.post("/geoai/spatial-analysis")
 def geoai_spatial_analysis(request: SpatialAnalysisRequest) -> dict:
+    if request.aoi is not None:
+        raise HTTPException(
+            status_code=422,
+            detail="AOI clipping is not implemented; this endpoint summarizes the full input raster extent.",
+        )
     dataset_dir = settings.data_dir / request.dataset_id
     try:
         dataset = _dataset(dataset_dir)
     except DatasetError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     historical = None
-    if request.include_history:
+    if request.include_history and request.dataset_id == "current":
         try:
-            historical = _dataset(settings.data_dir / "historical")
-        except DatasetError:
-            historical = None
+            historical = _check_dataset(
+                settings.data_dir / "historical", "ndvi"
+            )
+        except DatasetError as exc:
+            history_warning = str(exc)
+        else:
+            history_warning = None
+    else:
+        history_warning = None
     result = summarize_spatial_patterns(dataset, historical, block_size=request.block_size)
-    return {"success": True, **result}
+    provenance_datasets = {
+        request.dataset_id: (dataset, ("B04", "B08"))
+    }
+    if historical is not None:
+        provenance_datasets["historical"] = (historical, ("B04", "B08"))
+    result["provenance"] = analysis_provenance("ndvi", provenance_datasets)
+    result["observation_dates"] = [
+        date
+        for date in (
+            dataset_provenance(
+                dataset_id, source_dataset, bands
+            ).get("acquisition_date")
+            for dataset_id, (source_dataset, bands) in provenance_datasets.items()
+        )
+        if date
+    ]
+    if history_warning:
+        result["warnings"] = [history_warning]
+    return {"success": result.get("status") == "ok", **result}
 
 
 @router.post("/geoai/vegetation-forecast")
 def geoai_vegetation_forecast(request: VegetationForecastRequest) -> dict:
-    observations = request.observations or []
-    if not observations:
-        try:
-            dataset = _dataset(settings.data_dir / request.dataset_id)
-        except DatasetError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        ndvi = calculate_ndvi(dataset.bands["B04"], dataset.bands["B08"])
-        observations = []
-        for idx, value in enumerate(np.asarray(ndvi["raster"][ndvi["valid_mask"]]).ravel()[:10]):
-            observations.append({"date": f"2024-01-{(idx % 28) + 1:02d}", "mean_ndvi": float(value)})
+    caller_supplied = request.observations is not None
+    warnings: list[str] = []
+    if caller_supplied:
+        observations = request.observations or []
+        warnings.append(
+            "Caller-supplied observations are not independently verified as satellite acquisitions."
+        )
+    else:
+        dataset_ids = (
+            ("current", "historical")
+            if request.dataset_id == "all"
+            else (request.dataset_id,)
+        )
+        observations, warnings = _dated_ndvi_observations(dataset_ids)
     if request.lookback_limit is not None and len(observations) > request.lookback_limit:
         observations = observations[-request.lookback_limit:]
     result = forecast_vegetation_trends(observations, horizon_days=request.horizon_days)
+    result["data_source"] = (
+        "caller_supplied_unverified"
+        if caller_supplied
+        else "unverified_raster_acquisition_tags"
+    )
+    result["data_classification"] = (
+        "caller_supplied_unverified"
+        if caller_supplied
+        else (
+            "synthetic"
+            if any(
+                observation["provenance"]["data_classification"] == "synthetic"
+                for observation in observations
+            )
+            else "unverified_local_input"
+        )
+    )
+    result["observation_warnings"] = warnings
+    result["observation_count"] = len(observations)
+    if caller_supplied and result.get("status") == "ok":
+        result["evaluation"] = {
+            "status": "unavailable",
+            "message": "Evaluation metrics are suppressed for caller-supplied observations that have not been independently verified.",
+            "metrics": {},
+        }
     if result.get("status") == "insufficient-data":
         return {"success": False, **result}
     return {"success": True, **result}
@@ -678,6 +1308,13 @@ def geoai_land_cover_transitions(request: TransitionRequest) -> dict:
     except DatasetError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     result = analyze_land_cover_transitions(current, historical)
+    result["provenance"] = analysis_provenance(
+        "landcover",
+        {
+            "current": (current, REQUIRED_BANDS["landcover"]),
+            "historical": (historical, REQUIRED_BANDS["landcover"]),
+        },
+    )
     if result.get("status") == "insufficient-data":
         return {"success": False, **result}
     return {"success": True, **result}
@@ -685,48 +1322,156 @@ def geoai_land_cover_transitions(request: TransitionRequest) -> dict:
 
 @router.get("/geoai/model-evaluation")
 def geoai_model_evaluation() -> dict:
-    history = [
-        {"date": "2024-01-01", "mean_ndvi": 0.42},
-        {"date": "2024-02-01", "mean_ndvi": 0.44},
-        {"date": "2024-03-01", "mean_ndvi": 0.46},
-        {"date": "2024-04-01", "mean_ndvi": 0.45},
-        {"date": "2024-05-01", "mean_ndvi": 0.48},
-    ]
-    result = evaluate_forecast([item["mean_ndvi"] for item in history])
-    return {"success": True, **result}
+    observations, warnings = _dated_ndvi_observations()
+    if len(observations) < 5:
+        return {
+            "success": False,
+            "status": "insufficient-data",
+            "model": "linear-trend forecast baseline",
+            "data_classification": (
+                "synthetic"
+                if any(
+                    item["provenance"]["data_classification"] == "synthetic"
+                    for item in observations
+                )
+                else "unverified_local_input"
+            ),
+            "message": "Evaluation requires at least five distinct, metadata-dated NDVI observations; the available inputs do not establish supervised land-cover model accuracy.",
+            "observation_count": len(observations),
+            "observation_warnings": warnings,
+            "metrics": {},
+        }
+    result = evaluate_forecast(
+        [item["mean_ndvi"] for item in observations]
+    )
+    result["model"] = "linear-trend forecast baseline"
+    result["observation_dates"] = [item["date"] for item in observations]
+    result["observation_warnings"] = warnings
+    result["data_classification"] = (
+        "synthetic"
+        if any(
+            item["provenance"]["data_classification"] == "synthetic"
+            for item in observations
+        )
+        else "unverified_local_input"
+    )
+    result["limitations"] = (
+        "This is a time-ordered evaluation of the simple NDVI trend baseline, "
+        "not a supervised land-cover classifier evaluation. It uses only "
+        "metadata-dated local rasters and is not a substitute for independent ground truth."
+    )
+    return {"success": result.get("status") == "ok", **result}
 
 
 @router.get("/geoai/risk-indicators")
 def geoai_risk_indicators() -> dict:
-    result = detect_risk_indicators({
-        "ndvi": {"mean": 0.28, "std": 0.09},
-        "persistent_change": {"mean_ndvi_delta": -0.04},
-    })
+    try:
+        current = _check_dataset(settings.data_dir / "current", "ndvi")
+    except DatasetError as exc:
+        return {
+            "success": False,
+            "status": "insufficient-data",
+            "message": str(exc),
+            "indicators": [],
+            "count": 0,
+        }
+    spatial = summarize_spatial_patterns(current)
+    if spatial.get("status") != "ok":
+        return {
+            "success": False,
+            "status": "insufficient-data",
+            "message": spatial.get("message", "Current raster data is insufficient."),
+            "indicators": [],
+            "count": 0,
+        }
+    provenance_datasets = {"current": (current, REQUIRED_BANDS["ndvi"])}
+    current_date = dataset_provenance(
+        "current", current, REQUIRED_BANDS["ndvi"]
+    ).get("acquisition_date")
+    observation_dates = [current_date] if current_date else []
+    transition_summary = None
+    try:
+        historical = _check_dataset(settings.data_dir / "historical", "ndvi")
+    except DatasetError:
+        historical = None
+    if historical is not None:
+        provenance_datasets["historical"] = (
+            historical,
+            REQUIRED_BANDS["ndvi"],
+        )
+        historical_date = dataset_provenance(
+            "historical", historical, REQUIRED_BANDS["ndvi"]
+        ).get("acquisition_date")
+        if historical_date:
+            observation_dates.insert(0, historical_date)
+        spatial = summarize_spatial_patterns(current, historical)
+        if all(code in current.bands and code in historical.bands for code in REQUIRED_BANDS["landcover"]):
+            transition_summary = analyze_land_cover_transitions(
+                current, historical
+            )
+            if transition_summary.get("status") != "ok":
+                transition_summary = None
+    spatial["observation_dates"] = observation_dates
+    spatial["data_quality"] = {
+        "status": "available",
+        "source": "available local raster inputs",
+        "warnings": [
+            warning
+            for dataset_id, (source_dataset, band_codes) in provenance_datasets.items()
+            for warning in dataset_provenance(
+                dataset_id, source_dataset, band_codes
+            )["quality_warnings"]
+        ],
+    }
+    result = detect_risk_indicators(
+        spatial, transition_summary=transition_summary
+    )
+    result["evidence_sources"] = {
+        dataset_id: dataset_provenance(dataset_id, source_dataset, band_codes)
+        for dataset_id, (source_dataset, band_codes) in provenance_datasets.items()
+    }
+    result["data_classification"] = (
+        "synthetic"
+        if any(
+            source["data_classification"] == "synthetic"
+            for source in result["evidence_sources"].values()
+        )
+        else "unverified_local_input"
+    )
     return {"success": True, **result}
 
 
 @router.get("/geoai/history")
 def geoai_history() -> dict:
-    try:
-        historical = _dataset(settings.data_dir / "historical")
-    except DatasetError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    series = []
-    if historical.bands:
-        for index, date in enumerate(["2024-01-01", "2024-02-01", "2024-03-01", "2024-04-01"]):
-            if "B04" in historical.bands and "B08" in historical.bands:
-                ndvi = calculate_ndvi(historical.bands["B04"], historical.bands["B08"])
-                values = ndvi["raster"][ndvi["valid_mask"]]
-                mean = float(np.mean(values)) if values.size else None
-                series.append({"date": date, "mean_ndvi": mean, "dataset_id": "historical"})
-    if not series:
-        return {"success": False, "status": "insufficient-data", "message": "Historic observations are unavailable."}
-    summary = summarize_observation_history(series)
-    return {"success": True, **summary}
+    observations, warnings = _dated_ndvi_observations()
+    if len(observations) < 2:
+        return {
+            "success": False,
+            "status": "insufficient-data",
+            "message": "At least two distinct raster acquisition dates are required; untagged or undated inputs are not treated as a time series.",
+            "observation_count": len(observations),
+            "observation_warnings": warnings,
+            "series": observations,
+        }
+    summary = summarize_observation_history(observations)
+    summary["observation_warnings"] = warnings
+    summary["data_classification"] = (
+        "synthetic"
+        if any(
+            observation["provenance"]["data_classification"] == "synthetic"
+            for observation in observations
+        )
+        else "unverified_local_input"
+    )
+    return {"success": summary.get("status") == "ok", **summary}
 
 
 def _visualization_path(kind: str) -> Path:
-    output_dir = settings.output_dir / "visualizations"
+    if settings.authentication_required:
+        data_root = _request_dataset_root()
+        output_dir = settings.output_dir / "users" / data_root.name / "visualizations"
+    else:
+        output_dir = settings.output_dir / "visualizations"
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir / f"{kind}.png"
 
@@ -776,7 +1521,10 @@ def _generate_visualization(kind: str) -> Path:
 
 
 @router.get("/visualization/{kind}")
-def visualization(kind: str):
+def visualization(
+    kind: str,
+    user: AuthenticatedUser | None = Depends(current_user),
+):
     if kind not in {"rgb", "ndvi", "ndwi", "ndbi", "landcover", "change"}:
         raise HTTPException(status_code=404, detail="Visualization layer was not found.")
     try:
@@ -787,93 +1535,361 @@ def visualization(kind: str):
 
 
 @router.post("/analyze/all")
-def analyze_all() -> dict:
+def analyze_all(
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    user: AuthenticatedUser | None = Depends(current_user),
+) -> dict:
+    idempotency_key = _validate_idempotency_key(idempotency_key)
+    with _analysis_slot():
+        return _run_all_analysis(idempotency_key, user)
+
+
+def _run_all_analysis(
+    idempotency_key: str | None,
+    user: AuthenticatedUser | None,
+) -> dict:
     result_id = uuid4().hex
-    result_dir = settings.output_dir / result_id
-    current = _dataset(settings.data_dir / "current")
-    historical = _dataset(settings.data_dir / "historical")
-    results = {}
-    for key in ANALYSES:
-        try:
-            if key == "change_detection":
-                results[key] = {
-                    "success": True,
-                    **_historical_analysis(result_dir, current=current, historical=historical),
-                }
-            else:
-                validated = _validate_dataset(current, key)
-                results[key] = {
-                    "success": True,
-                    **_single_result(result_dir, key, validated),
-                }
-        except DatasetError as exc:
-            results[key] = {"success": False, "message": str(exc)}
-    response = {
-        "success": True,
-        "id": result_id,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "dataset": {
-            "current": bool(current.bands),
-            "historical": bool(historical.bands),
-            "message": None if current.bands else EMPTY_DATA_MESSAGE,
-        },
-        **results,
+    input_parameters = {
+        "analysis_keys": list(ANALYSES),
+        "dataset_ids": ["current", "historical"],
     }
-    _store_result(result_id, result_dir, response)
-    return response
+    job_start = persistence_manager.start_job(
+        result_id,
+        "all",
+        input_parameters,
+        owner_id=user.id if user else None,
+        idempotency_key=idempotency_key,
+    )
+    result_id, job_id = job_start.analysis_id, job_start.job_id
+    if not job_start.created:
+        return _existing_analysis_response(
+            result_id,
+            job_id,
+            "all",
+            input_parameters,
+            user.id if user else None,
+        )
+    result_dir = settings.output_dir / result_id
+    try:
+        _check_analysis_deadline()
+        current = _dataset(settings.data_dir / "current")
+        historical = _dataset(settings.data_dir / "historical")
+        results = {}
+        for key in ANALYSES:
+            _check_analysis_deadline()
+            try:
+                if key == "change_detection":
+                    results[key] = {
+                        "success": True,
+                        **_historical_analysis(result_dir, current=current, historical=historical),
+                    }
+                else:
+                    validated = _validate_dataset(current, key)
+                    results[key] = {
+                        "success": True,
+                        **_single_result(result_dir, key, validated),
+                    }
+            except DatasetError as exc:
+                results[key] = {"success": False, "message": str(exc)}
+        response = {
+            "success": True,
+            "id": result_id,
+            "job_id": job_id,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "dataset": {
+                "current": bool(current.bands),
+                "historical": bool(historical.bands),
+                "message": None if current.bands else EMPTY_DATA_MESSAGE,
+            },
+            **results,
+        }
+        _check_analysis_deadline()
+        _store_result(result_id, result_dir, response, job_id)
+        return response
+    except Exception as exc:
+        persistence_manager.fail_job(job_id, f"{type(exc).__name__}: {exc}")
+        if isinstance(exc, HTTPException) and exc.status_code == 504:
+            headers = dict(exc.headers or {})
+            headers.setdefault("X-Processing-Job-ID", job_id)
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail=exc.detail,
+                headers=headers,
+            ) from exc
+        raise
 
 
 @router.post("/analyze/{analysis_key}")
-def analyze(analysis_key: str) -> dict:
-    return _run_analysis(analysis_key)
+def analyze(
+    analysis_key: str,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    user: AuthenticatedUser | None = Depends(current_user),
+) -> dict:
+    with _analysis_slot():
+        return _run_analysis(
+            analysis_key,
+            user.id if user else None,
+            _validate_idempotency_key(idempotency_key),
+        )
 
 
 @router.get("/results")
-def list_results() -> dict:
-    results = []
+def list_results(
+    limit: int = Query(DEFAULT_RESULTS_PAGE_SIZE, ge=1, le=MAX_RESULTS_PAGE_SIZE),
+    offset: int = Query(0, ge=0, le=10_000),
+    user: AuthenticatedUser | None = Depends(current_user),
+) -> dict:
+    results_by_id = {}
+    owner_id = user.id if user else None
+    has_more = False
+    persisted_results = persistence_manager.list_analyses(
+        owner_id,
+        limit=limit,
+        offset=offset,
+    )
+    if persisted_results is not None:
+        has_more = len(persisted_results) > limit
+        for result in persisted_results[:limit]:
+            results_by_id[result["id"]] = {
+                "id": result["id"],
+                "created_at": result["created_at"],
+                "analysis": result["analysis"],
+            }
+        page = list(results_by_id.values())
+        return {
+            "success": True,
+            "results": page,
+            "has_more": has_more,
+            "next_offset": offset + len(page) if has_more else None,
+        }
+
     output_dir = settings.output_dir
-    if not output_dir.exists():
-        return {"success": True, "results": results}
-    for path in sorted(output_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
-        summary_path = path / "summary.json"
-        if path.is_dir() and summary_path.is_file():
+    if user is None and not settings.authentication_required and output_dir.exists():
+        def modified_time(path: Path) -> float:
+            try:
+                return path.stat().st_mtime
+            except OSError:
+                return 0.0
+
+        candidate_limit = offset + limit + 1
+        candidates = heapq.nlargest(
+            candidate_limit,
+            (
+                path
+                for path in output_dir.iterdir()
+                if path.is_dir() and (path / "summary.json").is_file()
+            ),
+            key=modified_time,
+        )
+        has_more = len(candidates) > offset + limit
+        for path in candidates[offset : offset + limit]:
+            summary_path = path / "summary.json"
             try:
                 summary = json.loads(summary_path.read_text(encoding="utf-8"))
-                results.append(
-                    {
-                        "id": summary.get("id"),
+                summary_id = summary.get("id")
+                if summary_id:
+                    results_by_id[summary_id] = {
+                        "id": summary_id,
                         "created_at": summary.get("created_at"),
                         "analysis": summary.get("analysis", "Analysis bundle"),
                     }
-                )
             except (OSError, json.JSONDecodeError):
                 continue
-    return {"success": True, "results": results}
+    page = list(results_by_id.values())
+    return {
+        "success": True,
+        "results": page,
+        "has_more": has_more if user is None and not settings.authentication_required else False,
+        "next_offset": (
+            offset + len(page)
+            if has_more and user is None and not settings.authentication_required
+            else None
+        ),
+    }
 
 
 @router.get("/results/{result_id}")
-def get_result(result_id: str) -> dict:
-    summary_path = _result_directory(result_id) / "summary.json"
+def get_result(
+    result_id: str,
+    user: AuthenticatedUser | None = Depends(current_user),
+) -> dict:
+    result_id = _validated_id(result_id)
+    record = persistence_manager.get_analysis(result_id, user.id if user else None)
+    if record and record["summary"] is not None:
+        return record["summary"]
+    if user is not None or settings.authentication_required:
+        raise HTTPException(status_code=404, detail="Result was not found.")
+    try:
+        summary_path = _result_directory(result_id) / "summary.json"
+    except HTTPException:
+        raise HTTPException(status_code=404, detail="Result was not found.")
     if not summary_path.is_file():
         raise HTTPException(status_code=404, detail="Result was not found.")
     return json.loads(summary_path.read_text(encoding="utf-8"))
 
 
+@router.get("/results/{result_id}/artifacts")
+def list_result_artifacts(
+    result_id: str,
+    user: AuthenticatedUser | None = Depends(current_user),
+) -> dict:
+    result_id = _validated_id(result_id)
+    artifacts = []
+    for artifact in persistence_manager.get_artifacts(
+        result_id, user.id if user else None
+    ):
+        artifacts.append(
+            {
+                "artifact_name": artifact["artifact_name"],
+                "media_type": artifact["media_type"],
+                "artifact_type": artifact.get("artifact_type", "file"),
+                "size_bytes": artifact["size_bytes"],
+                "created_at": artifact.get("created_at"),
+                "download_url": (
+                    f"/api/results/{result_id}/artifacts/"
+                    f"{quote(artifact['artifact_name'], safe='')}/download"
+                ),
+            }
+        )
+    return {
+        "success": True,
+        "result_id": result_id,
+        "artifacts": artifacts,
+    }
+
+
+@router.get("/results/{result_id}/artifacts/{artifact_name}/download")
+def download_registered_artifact(
+    result_id: str,
+    artifact_name: str,
+    user: AuthenticatedUser | None = Depends(current_user),
+):
+    result_id = _validated_id(result_id)
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,255}", artifact_name):
+        raise HTTPException(status_code=404, detail="Artifact was not found.")
+    try:
+        stored = persistence_manager.get_artifact(
+            result_id,
+            artifact_name,
+            owner_id=user.id if user else None,
+        )
+    except (ArtifactStorageError, OSError) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Analysis artifact storage is temporarily unavailable.",
+        ) from exc
+    if stored is None:
+        raise HTTPException(status_code=404, detail="Artifact was not found.")
+    file_obj, artifact = stored
+
+    def chunks():
+        try:
+            while chunk := file_obj.read(1024 * 1024):
+                yield chunk
+        finally:
+            file_obj.close()
+
+    return StreamingResponse(
+        chunks(),
+        media_type=artifact["media_type"] or "application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{artifact_name}"'},
+    )
+
+
+@router.get("/results/{result_id}/signed-download")
+def create_signed_download(
+    result_id: str,
+    artifact_name: str,
+    user: AuthenticatedUser | None = Depends(current_user),
+):
+    result_id = _validated_id(result_id)
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,255}", artifact_name):
+        raise HTTPException(status_code=404, detail="Artifact was not found.")
+    try:
+        signed_url = persistence_manager.create_signed_download_url(
+            result_id,
+            artifact_name,
+            owner_id=user.id if user else None,
+            expires_in=300,
+        )
+    except (ArtifactStorageError, OSError) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Analysis artifact storage is temporarily unavailable.",
+        ) from exc
+    if signed_url is None:
+        raise HTTPException(status_code=404, detail="Artifact was not found.")
+    return {"signed_url": signed_url, "expires_in": 300}
+
+
+def _stream_artifact(
+    result_id: str,
+    filename: str,
+    media_type: str,
+    download: bool = False,
+    owner_id: str | None = None,
+):
+    result_id = _validated_id(result_id)
+    try:
+        stored = persistence_manager.get_artifact(result_id, filename, owner_id)
+    except (ArtifactStorageError, OSError) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Analysis artifact storage is temporarily unavailable.",
+        ) from exc
+    if stored is not None:
+        file_obj, artifact = stored
+        actual_media_type = artifact["media_type"] or media_type
+        headers = {"Content-Disposition": f'attachment; filename="{filename}"'} if download else {}
+
+        def chunks():
+            try:
+                while chunk := file_obj.read(1024 * 1024):
+                    yield chunk
+            finally:
+                file_obj.close()
+
+        return StreamingResponse(chunks(), media_type=actual_media_type, headers=headers)
+    if owner_id is not None or settings.authentication_required:
+        raise HTTPException(status_code=404, detail="Artifact was not found.")
+    try:
+        path = _result_directory(result_id) / filename
+    except HTTPException:
+        raise HTTPException(status_code=404, detail="Artifact was not found.")
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Artifact was not found.")
+    return FileResponse(
+        path,
+        media_type=media_type,
+        filename=filename if download else None,
+    )
+
+
 @router.get("/results/{result_id}/download/{file_key}")
-def download_result(result_id: str, file_key: str):
+def download_result(
+    result_id: str,
+    file_key: str,
+    user: AuthenticatedUser | None = Depends(current_user),
+):
     if file_key not in DOWNLOAD_FILES:
         raise HTTPException(status_code=404, detail="Download was not found.")
-    path = _result_directory(result_id) / DOWNLOAD_FILES[file_key]
-    if not path.is_file():
-        raise HTTPException(status_code=404, detail="This output is not available for the selected result.")
-    return FileResponse(path, filename=DOWNLOAD_FILES[file_key])
+    return _stream_artifact(
+        result_id,
+        DOWNLOAD_FILES[file_key],
+        mimetypes.guess_type(DOWNLOAD_FILES[file_key])[0] or "application/octet-stream",
+        download=True,
+        owner_id=user.id if user else None,
+    )
 
 
 @router.get("/results/{result_id}/image/{analysis_key}")
-def get_result_image(result_id: str, analysis_key: str):
+def get_result_image(
+    result_id: str,
+    analysis_key: str,
+    user: AuthenticatedUser | None = Depends(current_user),
+):
     if analysis_key not in ANALYSES:
         raise HTTPException(status_code=404, detail="Map layer was not found.")
-    path = _result_directory(result_id) / f"{analysis_key}.png"
-    if not path.is_file():
-        raise HTTPException(status_code=404, detail="Map layer is not available.")
-    return FileResponse(path, media_type="image/png")
+    return _stream_artifact(
+        result_id, f"{analysis_key}.png", "image/png", owner_id=user.id if user else None
+    )

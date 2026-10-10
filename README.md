@@ -262,7 +262,11 @@ By combining satellite data, advanced AI, geospatial analytics, temporal compari
 
 ## 📌 Project Status
 
-Satellite Vision is intended to evolve through incremental, verifiable development. The features described in this document represent the long-term vision and proposed technical direction; their implementation status must be established from the actual source code and validated results.
+Satellite Vision is intended to evolve through incremental, verifiable development. Most capabilities described above are long-term vision, not current features. The checked-in implementation is a local-first GeoTIFF analysis prototype: it calculates NDVI, McFeeters NDWI, NDBI, a heuristic land-cover baseline, and aligned historical NDVI differences; it has a deterministic synthetic demo and a React/FastAPI dashboard.
+
+The active classifier is not a trained model. Live satellite scene search/download and AOI clipping are incomplete. Supabase Auth, PostgreSQL metadata, and private Storage code are present with mocked/local tests, but live cloud verification is not established. On 2026-10-10, the configured Vercel frontend and Render backend were reachable but served older/different builds; the live API returned 404 for current Auth/persistence/demo routes and rejected the analysis `Idempotency-Key` CORS preflight. `GET /api/results?limit=1` returned HTTP 200 both without credentials and with a malformed test bearer token (29-byte responses; bodies discarded). This establishes failure to reject those requests, not that user data was returned. Treat deployed result access as a potential authorization exposure; do not submit private data. The local synthetic demo is verified, but the public deployment is not demo-ready or production-ready.
+
+For current supported capabilities, setup, environment variable names, API routes, tests, and known limitations, see the [technical project README](satellite-intelligence/README.md). The editable [project report](satellite-intelligence/docs/final_submission/Satellite_Vision_Project_Report.docx), [presentation](satellite-intelligence/docs/final_submission/Satellite_Vision_Hackathon_Presentation.pptx), [demo script](satellite-intelligence/docs/final_submission/Satellite_Vision_Demo_Script.md), and [architecture package](satellite-intelligence/docs/final_submission/Satellite_Vision_Architecture.md) provide the Phase 16 submission materials.
 
 ## 📄 License
 

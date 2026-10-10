@@ -1,4 +1,4 @@
-export default function Header({ backendStatus }) {
+export default function Header({ backendStatus, userEmail, onSignOut, signingOut }) {
   const online = backendStatus === 'online';
   return (
     <header className="topbar">
@@ -8,7 +8,15 @@ export default function Header({ backendStatus }) {
           <i />
           {backendStatus === 'checking' ? 'Checking backend' : online ? 'System Online' : 'Backend Offline'}
         </span>
-        <span className="stage-badge">STAGE A · LOCAL</span>
+        <span className="stage-badge">
+          {userEmail ? 'PRIVATE WORKSPACE' : 'LOCAL DEMO · PUBLIC DATA ONLY'}
+        </span>
+        {userEmail && <span className="auth-user-label">{userEmail}</span>}
+        {onSignOut && (
+          <button className="auth-signout-button" type="button" onClick={onSignOut} disabled={signingOut}>
+            {signingOut ? 'Signing out…' : 'Sign out'}
+          </button>
+        )}
         <div className="avatar">SI</div>
       </div>
     </header>

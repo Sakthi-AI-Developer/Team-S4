@@ -27,7 +27,7 @@ class LocalSatelliteProvider(SatelliteProvider):
             return []
         return [{
             "product_id": "local-current",
-            "acquisition_date": "local",
+            "acquisition_date": None,
             "cloud_cover": None,
             "platform": "Local",
             "processing_level": "Stage-A",
@@ -36,7 +36,11 @@ class LocalSatelliteProvider(SatelliteProvider):
             "available_bands": ["B02", "B03", "B04", "B08", "B11"],
             "provider": self.name,
             "available": True,
-            "metadata": {"source": "local"},
+            "metadata": {
+                "source": "existing local GeoTIFF dataset",
+                "data_classification": "unverified_local_input",
+                "acquisition_date": None,
+            },
         }]
 
     def download(self, product_id: str, **kwargs) -> dict:

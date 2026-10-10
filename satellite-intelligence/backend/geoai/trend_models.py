@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import numpy as np
@@ -10,16 +10,29 @@ def _parse_date(value: Any) -> datetime | None:
     if value is None:
         return None
     if isinstance(value, datetime):
-        return value
+        return (
+            value.astimezone(timezone.utc).replace(tzinfo=None)
+            if value.tzinfo
+            else value
+        )
     if isinstance(value, str):
         text = value.strip()
         if not text:
             return None
-        for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y%m%d", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S%z"):
+        for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"):
             try:
                 return datetime.strptime(text, fmt)
             except ValueError:
                 continue
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return (
+            parsed.astimezone(timezone.utc).replace(tzinfo=None)
+            if parsed.tzinfo
+            else parsed
+        )
     return None
 
 
@@ -30,7 +43,12 @@ def fit_linear_trend(observations: list[dict[str, Any]]) -> dict[str, Any]:
         value = observation.get("mean_ndvi")
         if date is None or value is None:
             continue
-        valid.append((date, float(value)))
+        try:
+            numeric_value = float(value)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(numeric_value):
+            valid.append((date, numeric_value))
     if len(valid) < 2:
         return {"status": "insufficient-data", "message": "Forecasting requires at least two historical observations."}
     ordered = sorted(valid, key=lambda item: item[0])
@@ -51,17 +69,28 @@ def fit_linear_trend(observations: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def summarize_observation_history(observations: list[dict[str, Any]]) -> dict[str, Any]:
-    if not observations:
-        return {"status": "insufficient-data", "message": "Historical observations are unavailable."}
-    values = [float(item["mean_ndvi"]) for item in observations if item.get("mean_ndvi") is not None]
-    if len(values) < 2:
+    valid = []
+    for observation in observations:
+        date = _parse_date(observation.get("date") or observation.get("acquisition_date"))
+        value = observation.get("mean_ndvi")
+        if date is None or value is None:
+            continue
+        try:
+            numeric_value = float(value)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(numeric_value):
+            valid.append((date, numeric_value, observation))
+    valid.sort(key=lambda item: item[0])
+    if len(valid) < 2:
         return {"status": "insufficient-data", "message": "At least two viable NDVI observations are required."}
+    values = [item[1] for item in valid]
     return {
         "status": "ok",
         "count": len(values),
         "mean_ndvi": float(np.mean(values)),
         "latest_ndvi": float(values[-1]),
-        "start_date": observations[0].get("date") or observations[0].get("acquisition_date"),
-        "end_date": observations[-1].get("date") or observations[-1].get("acquisition_date"),
-        "series": observations,
+        "start_date": valid[0][0].date().isoformat(),
+        "end_date": valid[-1][0].date().isoformat(),
+        "series": [item[2] for item in valid],
     }

@@ -1,10 +1,15 @@
 from dataclasses import dataclass, field
 from pathlib import Path
 import re
-from typing import Iterable
+from typing import Callable, Iterable
 
 import numpy as np
 import rasterio
+from rasterio._err import CPLE_BaseError
+from rasterio.crs import CRS
+from rasterio.errors import CRSError, RasterioError
+from rasterio.transform import array_bounds
+from rasterio.warp import transform_bounds
 
 
 BAND_NAMES = {
@@ -31,6 +36,7 @@ class RasterBand:
     width: int
     height: int
     resolution: tuple[float, float]
+    tags: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -56,14 +62,48 @@ def identify_band(filename: str) -> str | None:
     return match.group(1) if match else None
 
 
-def _read_raster(path: Path, band: str) -> RasterBand:
+def _read_raster(
+    path: Path,
+    band: str,
+    max_pixels: int | None = None,
+    max_file_bytes: int | None = None,
+    max_input_array_bytes: int | None = None,
+    deadline_check: Callable[[], None] | None = None,
+) -> RasterBand:
     try:
+        if deadline_check:
+            deadline_check()
+        if max_file_bytes is not None and path.stat().st_size > max_file_bytes:
+            raise DatasetError(
+                f"{path.name} exceeds the configured raster file limit of "
+                f"{max_file_bytes} bytes."
+            )
         with rasterio.open(path) as src:
             if src.count < 1 or src.width < 1 or src.height < 1:
                 raise DatasetError(f"{path.name} contains no readable raster pixels.")
+            pixel_count = src.width * src.height
+            if max_pixels is not None and pixel_count > max_pixels:
+                raise DatasetError(
+                    f"{path.name} has {pixel_count} pixels; the configured analysis limit is "
+                    f"{max_pixels} pixels."
+                )
+            retained_array_bytes = pixel_count * (
+                np.dtype(np.float32).itemsize + np.dtype(bool).itemsize
+            )
+            if (
+                max_input_array_bytes is not None
+                and retained_array_bytes > max_input_array_bytes
+            ):
+                raise DatasetError(
+                    f"{path.name} requires {retained_array_bytes} bytes for its retained "
+                    f"input arrays; the remaining configured budget is "
+                    f"{max_input_array_bytes} bytes."
+                )
             values = src.read(1, masked=True).astype(np.float32)
             data = np.asarray(values.filled(np.nan), dtype=np.float32)
             valid = ~np.ma.getmaskarray(values) & np.isfinite(data)
+            if deadline_check:
+                deadline_check()
             if not np.any(valid):
                 raise DatasetError(f"{path.name} contains no valid pixels.")
             return RasterBand(
@@ -76,32 +116,65 @@ def _read_raster(path: Path, band: str) -> RasterBand:
                 width=src.width,
                 height=src.height,
                 resolution=src.res,
+                tags=src.tags(),
             )
     except DatasetError:
         raise
     except MemoryError as exc:
         raise DatasetError(f"{path.name} is too large to load into available memory.") from exc
-    except (rasterio.errors.RasterioError, OSError, ValueError) as exc:
+    except (RasterioError, OSError, ValueError) as exc:
         raise DatasetError(f"Could not read GeoTIFF {path.name}: {exc}") from exc
 
 
-def load_dataset(directory: Path, required: Iterable[str] = ()) -> SatelliteDataset:
+def load_dataset(
+    directory: Path,
+    required: Iterable[str] = (),
+    *,
+    include_other_bands: bool = True,
+    max_pixels: int | None = None,
+    max_file_bytes: int | None = None,
+    max_input_array_bytes: int | None = None,
+    deadline_check: Callable[[], None] | None = None,
+) -> SatelliteDataset:
     if not directory.exists() or not directory.is_dir():
         raise DatasetError(f"Dataset directory is unavailable: {directory.name}.")
     candidates: dict[str, Path] = {}
+    required_order = tuple(required)
+    required_codes = set(required_order)
+    if max_file_bytes is not None and max_file_bytes <= 0:
+        raise DatasetError("Raster file-size limit must be positive.")
+    if max_input_array_bytes is not None and max_input_array_bytes <= 0:
+        raise DatasetError("Input array memory budget must be positive.")
     for path in sorted(directory.iterdir()):
         if path.is_file() and path.suffix.lower() in {".tif", ".tiff"}:
             band = identify_band(path.name)
-            if band and band not in candidates:
+            if (
+                band
+                and (include_other_bands or not required_codes or band in required_codes)
+                and band not in candidates
+            ):
                 candidates[band] = path
     loaded = {}
     errors = []
+    remaining_array_bytes = max_input_array_bytes
     for code, path in candidates.items():
         try:
-            loaded[code] = _read_raster(path, code)
+            if deadline_check:
+                deadline_check()
+            band = _read_raster(
+                path,
+                code,
+                max_pixels=max_pixels,
+                max_file_bytes=max_file_bytes,
+                max_input_array_bytes=remaining_array_bytes,
+                deadline_check=deadline_check,
+            )
+            loaded[code] = band
+            if remaining_array_bytes is not None:
+                remaining_array_bytes -= band.data.nbytes + band.valid.nbytes
         except DatasetError as exc:
             errors.append(str(exc))
-    missing = [band for band in required if band not in loaded]
+    missing = [band for band in required_order if band not in loaded]
     return SatelliteDataset(
         directory=directory,
         bands=loaded,
@@ -171,7 +244,10 @@ def raster_statistics(array: np.ndarray, valid: np.ndarray) -> dict[str, float |
 def pixel_area_square_metres(band: RasterBand) -> float | None:
     if not band.crs:
         return None
-    crs = rasterio.crs.CRS.from_string(band.crs)
+    try:
+        crs = CRS.from_string(band.crs)
+    except CRSError:
+        return None
     if not crs.is_projected:
         return None
     unit_details = crs.linear_units_factor
@@ -184,16 +260,33 @@ def pixel_area_square_metres(band: RasterBand) -> float | None:
 def raster_metadata(band: RasterBand | None) -> dict | None:
     if band is None:
         return None
-    bounds = rasterio.transform.array_bounds(band.height, band.width, band.transform)
-    if band.crs and band.crs != "EPSG:4326":
+    bounds = array_bounds(band.height, band.width, band.transform)
+    if not band.crs:
+        bounds = None
+    elif band.crs != "EPSG:4326":
         try:
-            bounds = rasterio.warp.transform_bounds(band.crs, "EPSG:4326", *bounds, densify_pts=21)
-        except Exception:
-            pass
-    west, south, east, north = bounds
+            source_crs = CRS.from_string(band.crs)
+            if source_crs.is_geographic or source_crs.is_projected:
+                bounds = transform_bounds(
+                    band.crs, "EPSG:4326", *bounds, densify_pts=21
+                )
+            else:
+                bounds = None
+        except (CPLE_BaseError, RasterioError, ValueError):
+            bounds = None
+    geographic_bounds = None
+    if bounds is not None:
+        if np.all(np.isfinite(bounds)):
+            west, south, east, north = bounds
+            geographic_bounds = {
+                "west": float(west),
+                "south": float(south),
+                "east": float(east),
+                "north": float(north),
+            }
     return {
         "crs": band.crs,
-        "bounds": {"west": float(west), "south": float(south), "east": float(east), "north": float(north)},
+        "bounds": geographic_bounds,
         "width": int(band.width),
         "height": int(band.height),
         "resolution": [float(value) for value in band.resolution],

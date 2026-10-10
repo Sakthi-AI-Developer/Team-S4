@@ -11,7 +11,7 @@ from processing.preprocessing import DatasetError, RasterBand, build_profile, lo
 from processing.landcover import LandCoverClassifier
 
 
-def make_band(code, data, transform=None, crs="EPSG:32644"):
+def make_band(code, data, transform=None, crs: str | None = "EPSG:32644"):
     array = np.asarray(data, dtype=np.float32)
     return RasterBand(
         code=code,
@@ -86,6 +86,61 @@ def test_dataset_loader_keeps_corrupt_raster_errors(tmp_path):
     assert dataset.errors
     with pytest.raises(DatasetError, match="B04"):
         dataset.require(("B04",))
+
+
+def test_dataset_loader_reads_only_required_bands_and_enforces_pixel_limit(tmp_path):
+    for code in ("B02", "B04", "B08"):
+        path = tmp_path / f"{code}.tif"
+        with rasterio.open(
+            path,
+            "w",
+            driver="GTiff",
+            height=2,
+            width=2,
+            count=1,
+            dtype="float32",
+            crs="EPSG:32644",
+            transform=from_origin(0, 20, 10, 10),
+            nodata=-9999,
+        ) as output:
+            output.write(np.ones((2, 2), dtype=np.float32), 1)
+
+    selected = load_dataset(
+        tmp_path,
+        required=("B04", "B08"),
+        include_other_bands=False,
+        max_pixels=4,
+    )
+    assert set(selected.bands) == {"B04", "B08"}
+    assert selected.errors == []
+
+    bounded = load_dataset(
+        tmp_path,
+        required=("B04",),
+        include_other_bands=False,
+        max_pixels=3,
+    )
+    assert bounded.missing_bands == ["B04"]
+    with pytest.raises(DatasetError, match="analysis limit is 3 pixels"):
+        bounded.require(("B04",))
+
+    array_limited = load_dataset(
+        tmp_path,
+        required=("B04",),
+        include_other_bands=False,
+        max_input_array_bytes=19,
+    )
+    assert array_limited.missing_bands == ["B04"]
+    assert any("retained input arrays" in error for error in array_limited.errors)
+
+    file_limited = load_dataset(
+        tmp_path,
+        required=("B04",),
+        include_other_bands=False,
+        max_file_bytes=1,
+    )
+    assert file_limited.missing_bands == ["B04"]
+    assert any("raster file limit" in error for error in file_limited.errors)
 
 
 def test_alignment_requires_known_crs():

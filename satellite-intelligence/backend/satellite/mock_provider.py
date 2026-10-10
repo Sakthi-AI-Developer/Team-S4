@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from datetime import datetime
-
 import numpy as np
 import rasterio
 from rasterio.transform import from_origin
@@ -14,6 +12,12 @@ from satellite.models import SatelliteProduct
 
 class MockSatelliteProvider(SatelliteProvider):
     name = "mock"
+    PRODUCT_ID = "synthetic-demo-fixture-v1"
+    LOCAL_CRS = (
+        'LOCAL_CS["Synthetic demo grid",'
+        'LOCAL_DATUM["Synthetic local datum",0],UNIT["metre",1],'
+        'AXIS["Easting",EAST],AXIS["Northing",NORTH]]'
+    )
 
     def __init__(self, cache_manager: CacheManager | None = None):
         self.cache_manager = cache_manager or CacheManager(settings.satellite_cache_dir)
@@ -26,30 +30,45 @@ class MockSatelliteProvider(SatelliteProvider):
         return {
             "provider": self.name,
             "configured": True,
+            "available": True,
             "mode": "mock",
-            "message": "Mock satellite provider is active for automated validation only.",
+            "data_classification": "synthetic",
+            "message": "A synthetic fixture is available; it is not a live satellite observation.",
         }
 
     def search(self, request, **kwargs) -> list[dict]:
-        product_id = f"mock-s2-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
         product = SatelliteProduct(
-            product_id=product_id,
-            acquisition_date="2024-02-14",
-            cloud_cover=12.5,
-            platform="Sentinel-2",
-            processing_level="L2A",
-            spatial_coverage="Mock AOI",
-            product_size_mb=18.4,
+            product_id=self.PRODUCT_ID,
+            platform="Synthetic demo fixture",
+            spatial_coverage="None; the fixture has no real-world coordinates.",
             available_bands=["B02", "B03", "B04", "B08", "B11"],
             provider=self.name,
             available=True,
-            metadata={"source": "mock"},
+            metadata={
+                "source": "deterministic synthetic fixture",
+                "data_classification": "synthetic",
+                "acquisition_date": None,
+                "cloud_cover": None,
+                "geographic_coverage": None,
+            },
         )
         return [product.to_dict()]
 
     def download(self, product_id: str, **kwargs) -> dict:
+        if product_id != self.PRODUCT_ID:
+            raise KeyError("No synthetic demo fixture was found for that product ID.")
         product_dir = self.cache_manager.product_dir(product_id)
         product_dir.mkdir(parents=True, exist_ok=True)
+        if all((product_dir / f"{band}.tif").is_file() for band in ("B02", "B03", "B04", "B08", "B11")):
+            return {
+                "success": True,
+                "product_id": product_id,
+                "provider": self.name,
+                "bands": ["B02", "B03", "B04", "B08", "B11"],
+                "cache_dir": str(product_dir),
+                "data_classification": "synthetic",
+                "message": "Existing deterministic synthetic fixture reused.",
+            }
         for band in ("B02", "B03", "B04", "B08", "B11"):
             path = product_dir / f"{band}.tif"
             data = np.full((2, 2), 0.2 + (ord(band[1]) % 5) * 0.1, dtype=np.float32)
@@ -61,20 +80,28 @@ class MockSatelliteProvider(SatelliteProvider):
                 width=2,
                 count=1,
                 dtype="float32",
-                crs="EPSG:32644",
-                transform=from_origin(500000, 3000000, 10, 10),
+                crs=self.LOCAL_CRS,
+                transform=from_origin(0, 2, 1, 1),
                 nodata=-9999,
             ) as dst:
                 dst.write(data, 1)
+                dst.update_tags(
+                    SATELLITE_VISION_DATA_KIND="synthetic",
+                    SOURCE="deterministic mock satellite fixture",
+                )
         payload = {
             "product_id": product_id,
             "provider": self.name,
-            "acquisition_date": "2024-02-14",
-            "cloud_cover": 12.5,
-            "platform": "Sentinel-2",
+            "acquisition_date": None,
+            "cloud_cover": None,
+            "platform": "Synthetic demo fixture",
             "available_bands": ["B02", "B03", "B04", "B08", "B11"],
             "available": True,
-            "metadata": {"source": "mock"},
+            "metadata": {
+                "source": "deterministic synthetic fixture",
+                "data_classification": "synthetic",
+                "geographic_coverage": None,
+            },
         }
         self.cache_manager.write_metadata(product_id, payload)
         return {
@@ -83,6 +110,7 @@ class MockSatelliteProvider(SatelliteProvider):
             "provider": self.name,
             "bands": payload["available_bands"],
             "cache_dir": str(product_dir),
+            "data_classification": "synthetic",
         }
 
     def list_products(self) -> list[dict]:

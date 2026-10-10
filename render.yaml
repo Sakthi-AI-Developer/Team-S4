@@ -3,10 +3,42 @@ services:
     name: satellite-vision-api
     runtime: python
     buildCommand: pip install -r satellite-intelligence/backend/requirements.txt
-    startCommand: uvicorn --app-dir satellite-intelligence/backend main:app --host 0.0.0.0 --port $PORT
-    healthCheckPath: /api/health
+    startCommand: >-
+      if [ -n "$DATABASE_URL" ]; then alembic -c satellite-intelligence/backend/alembic.ini upgrade head || exit $?; fi;
+      uvicorn --app-dir satellite-intelligence/backend main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/ready
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.11
       - key: CORS_ORIGINS
         value: https://team-s4-ten.vercel.app
+      - key: DATABASE_URL
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: SUPABASE_STORAGE_BUCKET
+        value: satellite-analysis-results
+      - key: REQUIRE_AUTH
+        value: "true"
+      - key: MAX_ARTIFACT_BYTES
+        value: "536870912"
+      - key: MAX_UPLOAD_BYTES
+        value: "536870912"
+      - key: MAX_RASTER_BYTES
+        value: "536870912"
+      - key: MAX_RASTER_PIXELS
+        value: "1000000"
+      - key: MAX_INPUT_ARRAY_BYTES
+        value: "134217728"
+      - key: MAX_ANALYSIS_SECONDS
+        value: "300"
+      - key: MAX_CONCURRENT_ANALYSES
+        value: "1"
+      - key: DATABASE_POOL_SIZE
+        value: "3"
+      - key: DATABASE_MAX_OVERFLOW
+        value: "1"

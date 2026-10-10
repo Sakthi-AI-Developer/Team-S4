@@ -1,17 +1,25 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
-import { apiRootUrl, downloadSatellite, getDataset, getGeoAIHistory, getGeoAIModelEvaluation, getGeoAIRiskIndicators, getGeoAIStatus, getHealth, getResults, getResult, getSatelliteStatus, runAllAnalysis, runChangeDetection, runGeoAILandCoverTransitions, runGeoAISpatialAnalysis, runGeoAIVegetationForecast, runLandcover, runNDBI, runNDVI, runNDWI, searchSatellite, uploadBand } from './services/api';
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { apiRootUrl, downloadSatellite, getAuthStatus, getDataset, getGeoAIDemoScenario, getGeoAIHistory, getGeoAIModelEvaluation, getGeoAIRiskIndicators, getGeoAIStatus, getHealth, getResults, getResult, getResultArtifacts, getSatelliteStatus, runAllAnalysis, runChangeDetection, runGeoAILandCoverTransitions, runGeoAISpatialAnalysis, runGeoAIVegetationForecast, runLandcover, runNDBI, runNDVI, runNDWI, searchSatellite, uploadBand } from './services/api';
 import AnalysisPanel from './components/AnalysisPanel';
-import ChangeChart from './components/ChangeChart';
+import AuthPanel from './components/AuthPanel';
 import DatasetSelector from './components/DatasetSelector';
 import DownloadPanel from './components/DownloadPanel';
 import ErrorMessage from './components/ErrorMessage';
 import Header from './components/Header';
 import InsightPanel from './components/InsightPanel';
-import LandCoverChart from './components/LandCoverChart';
 import Legend from './components/Legend';
 import LoadingIndicator from './components/LoadingIndicator';
-import MapView from './components/MapView';
 import MetricCard from './components/MetricCard';
+import {
+  getSupabaseSession,
+  signOut,
+  subscribeToAuthState,
+  supabaseAuthConfigured,
+} from './services/supabase';
+
+const MapView = lazy(() => import('./components/MapView'));
+const LandCoverChart = lazy(() => import('./components/LandCoverChart'));
+const ChangeChart = lazy(() => import('./components/ChangeChart'));
 
 const layerConfig = [
   { key: 'ndvi', label: 'NDVI', color: '#83bf79' },
@@ -40,9 +48,20 @@ function analysisMapFromResponse(response) {
 }
 
 function friendlyError(error) {
-  if (!error.response) return 'Backend is unavailable. Start the FastAPI server to enable satellite analysis.';
+  if (error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT') {
+    return 'The request timed out. Check recent results before starting the analysis again.';
+  }
+  if (!error.response) return 'Backend is unavailable. Check the API connection; results were not updated.';
+  if (error.response.status === 401) return 'Your sign-in expired. Sign in again to continue.';
   const detail = error.response.data?.detail;
   return typeof detail === 'string' ? detail : 'Unable to process the selected dataset.';
+}
+
+function logSafeRequestFailure(event, error) {
+  console.error(event, {
+    status: error?.response?.status,
+    code: typeof error?.code === 'string' ? error.code : undefined,
+  });
 }
 
 function healthErrorMessage(error) {
@@ -54,6 +73,10 @@ function healthErrorMessage(error) {
 }
 
 function App() {
+  const [authMode, setAuthMode] = useState('checking');
+  const [authRequired, setAuthRequired] = useState(false);
+  const [authUser, setAuthUser] = useState(null);
+  const [authNotice, setAuthNotice] = useState('');
   const [backendStatus, setBackendStatus] = useState('checking');
   const [backendError, setBackendError] = useState('');
   const [dataset, setDataset] = useState(null);
@@ -63,7 +86,12 @@ function App() {
   const [analyses, setAnalyses] = useState({});
   const [resultId, setResultId] = useState(null);
   const [recentResults, setRecentResults] = useState([]);
+  const [nextResultsOffset, setNextResultsOffset] = useState(null);
+  const [loadingOlderResults, setLoadingOlderResults] = useState(false);
   const [resultLoading, setResultLoading] = useState(false);
+  const [resultArtifacts, setResultArtifacts] = useState([]);
+  const [artifactsLoading, setArtifactsLoading] = useState(false);
+  const [artifactsError, setArtifactsError] = useState('');
   const [activeLayer, setActiveLayer] = useState('ndvi');
   const [dataSource, setDataSource] = useState('local');
   const [satelliteStatus, setSatelliteStatus] = useState({ configured: false, provider: 'local', message: 'Stage-A local dataset mode is active.' });
@@ -76,11 +104,9 @@ function App() {
     risk: null,
     evaluation: null,
   });
-  const [aoi, setAoi] = useState({
-    type: 'Polygon',
-    coordinates: [[[-1, 50], [-1, 51], [0, 51], [0, 50], [-1, 50]]],
-  });
-  const [searchWindow, setSearchWindow] = useState({ startDate: '2024-01-01', endDate: '2024-01-15', maxCloudCover: 20 });
+  const [aoi, setAoi] = useState(null);
+  const [aoiText, setAoiText] = useState('');
+  const [searchWindow, setSearchWindow] = useState({ startDate: '', endDate: '', maxCloudCover: 20 });
   const [satelliteResults, setSatelliteResults] = useState([]);
   const [selectedProductId, setSelectedProductId] = useState('');
   const [liveLoading, setLiveLoading] = useState(false);
@@ -88,6 +114,31 @@ function App() {
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [isDemoMode, setIsDemoMode] = useState(false);
+  const [demoSummary, setDemoSummary] = useState(null);
+  const [demoLoading, setDemoLoading] = useState(false);
+  const [signingOut, setSigningOut] = useState(false);
+  const analysisRequestActive = useRef(false);
+
+  const clearPrivateWorkspace = useCallback(() => {
+    setDataset(null);
+    setAnalyses({});
+    setResultId(null);
+    setRecentResults([]);
+    setResultArtifacts([]);
+    setArtifactsError('');
+    setDemoSummary(null);
+    setIsDemoMode(false);
+    setSatelliteResults([]);
+    setSelectedProductId('');
+    setGeoAIInsights({
+      history: null,
+      forecast: null,
+      transitions: null,
+      spatial: null,
+      risk: null,
+      evaluation: null,
+    });
+  }, []);
 
   const refreshDataset = useCallback(async () => {
     setDatasetLoading(true);
@@ -104,8 +155,42 @@ function App() {
     try {
       const response = await getResults();
       setRecentResults(response.results ?? []);
-    } catch {
+      setNextResultsOffset(response.next_offset ?? null);
+    } catch (requestError) {
       setRecentResults([]);
+      setNextResultsOffset(null);
+      setError(friendlyError(requestError));
+    }
+  }, []);
+
+  const loadOlderResults = useCallback(async () => {
+    if (nextResultsOffset === null || loadingOlderResults) return;
+    setLoadingOlderResults(true);
+    try {
+      const response = await getResults(nextResultsOffset);
+      setRecentResults((previous) => {
+        const existingIds = new Set(previous.map((item) => item.id));
+        return [...previous, ...(response.results ?? []).filter((item) => !existingIds.has(item.id))];
+      });
+      setNextResultsOffset(response.next_offset ?? null);
+    } catch (requestError) {
+      setError(friendlyError(requestError));
+    } finally {
+      setLoadingOlderResults(false);
+    }
+  }, [loadingOlderResults, nextResultsOffset]);
+
+  const loadResultArtifacts = useCallback(async (id) => {
+    setArtifactsLoading(true);
+    setArtifactsError('');
+    try {
+      const response = await getResultArtifacts(id);
+      setResultArtifacts(response.artifacts ?? []);
+    } catch {
+      setResultArtifacts([]);
+      setArtifactsError('Saved artifact metadata could not be loaded. Try selecting this result again.');
+    } finally {
+      setArtifactsLoading(false);
     }
   }, []);
 
@@ -114,7 +199,7 @@ function App() {
       const status = await getGeoAIStatus();
       setGeoAIStatus(status);
     } catch (error) {
-      console.error('Failed to fetch GeoAI status', error);
+      logSafeRequestFailure('Failed to fetch GeoAI status.', error);
       setGeoAIStatus({ status: 'unavailable', available: false, components: [] });
     }
 
@@ -129,12 +214,77 @@ function App() {
       ]);
       setGeoAIInsights({ history, forecast, transitions, spatial, risk, evaluation });
     } catch (error) {
-      console.error('Failed to refresh GeoAI insights', error);
+      logSafeRequestFailure('Failed to refresh GeoAI insights.', error);
       setGeoAIInsights({ history: null, forecast: null, transitions: null, spatial: null, risk: null, evaluation: null });
     }
   }, []);
 
   useEffect(() => {
+    let mounted = true;
+    async function checkAuthentication() {
+      try {
+        const [status, session] = await Promise.all([getAuthStatus(), getSupabaseSession()]);
+        if (!mounted) return;
+        const required = Boolean(status.authentication_required);
+        setAuthRequired(required);
+        if (required && !supabaseAuthConfigured) {
+          setAuthMode('configuration-error');
+          return;
+        }
+        if (required && !session) {
+          setAuthMode('login');
+          return;
+        }
+        setAuthUser(required ? session?.user ?? null : null);
+        setAuthMode('ready');
+      } catch (error) {
+        if (mounted) {
+          setBackendStatus('offline');
+          setBackendError(healthErrorMessage(error));
+          setAuthMode('unavailable');
+        }
+      }
+    }
+    checkAuthentication();
+    return () => { mounted = false; };
+  }, []);
+
+  useEffect(() => {
+    if (authMode === 'checking' || !authRequired || !supabaseAuthConfigured) {
+      return undefined;
+    }
+    return subscribeToAuthState((event, session) => {
+      if (event === 'SIGNED_OUT') {
+        clearPrivateWorkspace();
+        setAuthUser(null);
+        setAuthMode(authRequired ? 'login' : 'ready');
+        return;
+      }
+      if (session?.user) {
+        if (authUser?.id !== session.user.id) clearPrivateWorkspace();
+        setAuthUser(session.user);
+        if (authRequired) setAuthMode('ready');
+      }
+    });
+  }, [authMode, authRequired, authUser?.id, clearPrivateWorkspace]);
+
+  useEffect(() => {
+    function handleExpiredSession(event) {
+      clearPrivateWorkspace();
+      setAuthUser(null);
+      setAuthNotice(
+        event.detail?.sessionClearFailed
+          ? 'Your session expired. Sign in again; this browser could not clear the expired session automatically.'
+          : 'Your session expired. Sign in again to continue.',
+      );
+      setAuthMode(authRequired ? 'login' : 'ready');
+    }
+    window.addEventListener('satellite:auth-expired', handleExpiredSession);
+    return () => window.removeEventListener('satellite:auth-expired', handleExpiredSession);
+  }, [authRequired, clearPrivateWorkspace]);
+
+  useEffect(() => {
+    if (authMode !== 'ready') return undefined;
     let mounted = true;
     async function initialize() {
       const healthCheck = getHealth()
@@ -155,7 +305,7 @@ function App() {
     }
     initialize();
     return () => { mounted = false; };
-  }, [loadGeoAIInsights, refreshDataset, refreshResults]);
+  }, [authMode, loadGeoAIInsights, refreshDataset, refreshResults]);
 
   const current = analyses.ndvi;
   const ndwi = analyses.ndwi;
@@ -164,6 +314,7 @@ function App() {
   const change = analyses.change_detection;
   const selected = analyses[activeLayer];
   const mapLayer = layerConfig.find((layer) => layer.key === activeLayer);
+  const selectedProvenance = selected?.provenance?.datasets ?? {};
 
   const insights = useMemo(() => {
     const messages = [];
@@ -189,6 +340,8 @@ function App() {
   };
 
   async function handleAnalysis(key) {
+    if (analysisRequestActive.current) return;
+    analysisRequestActive.current = true;
     setBusy(key);
     setError('');
     setNotice('');
@@ -199,16 +352,20 @@ function App() {
         [key]: { ...response.result, result_id: response.id },
       }));
       setResultId(response.id);
+      await loadResultArtifacts(response.id);
       setNotice(`${response.analysis} completed using local satellite imagery.`);
       await refreshResults();
     } catch (requestError) {
       setError(friendlyError(requestError));
     } finally {
+      analysisRequestActive.current = false;
       setBusy('');
     }
   }
 
   async function handleAllAnalysis() {
+    if (analysisRequestActive.current) return;
+    analysisRequestActive.current = true;
     setBusy('all');
     setError('');
     setNotice('');
@@ -216,10 +373,12 @@ function App() {
       const response = await runAllAnalysis();
       setResultId(response.id);
       acceptAllResponse(response);
+      await loadResultArtifacts(response.id);
       await refreshResults();
     } catch (requestError) {
       setError(friendlyError(requestError));
     } finally {
+      analysisRequestActive.current = false;
       setBusy('');
     }
   }
@@ -266,6 +425,7 @@ function App() {
     try {
       const response = await getResult(id);
       setResultId(id);
+      await loadResultArtifacts(id);
       if (response.result) {
         const analysisTitle = response.result.analysis?.toLowerCase() ?? '';
         const matching = layerConfig.find(({ key, label }) =>
@@ -295,12 +455,24 @@ function App() {
 
   async function handleSatelliteSearch(event) {
     event.preventDefault();
+    let parsedAoi;
+    try {
+      parsedAoi = JSON.parse(aoiText);
+    } catch {
+      setError('Enter a valid AOI GeoJSON polygon before searching.');
+      return;
+    }
+    if (!searchWindow.startDate || !searchWindow.endDate) {
+      setError('Select both a start date and an end date before searching.');
+      return;
+    }
+    setAoi(parsedAoi);
     setLiveLoading(true);
     setError('');
     setNotice('');
     try {
       const response = await searchSatellite({
-        aoi,
+        aoi: parsedAoi,
         start_date: searchWindow.startDate,
         end_date: searchWindow.endDate,
         max_cloud_cover: Number(searchWindow.maxCloudCover),
@@ -312,7 +484,9 @@ function App() {
       }
       setSatelliteResults(response.results);
       setSelectedProductId(response.results[0].product_id);
-      setNotice('Satellite scenes were found. Select a product to use it in the analysis pipeline.');
+      setNotice(response.provider === 'mock'
+        ? 'A synthetic fixture was returned for demo use. It is not a satellite observation.'
+        : 'Satellite scenes were found. Select a product to use it in the analysis pipeline.');
     } catch (requestError) {
       setError(requestError.response?.data?.detail || 'Live search is unavailable.');
     } finally {
@@ -330,12 +504,14 @@ function App() {
     setNotice('');
     try {
       const response = await downloadSatellite({ product_id: selectedProductId, aoi });
-      setNotice(`Scene ${selectedProductId} is ready for analysis.`);
       setDataSource('local');
       await refreshDataset();
-      setSatelliteStatus((previous) => ({ ...previous, provider: 'live', configured: true, message: `Scene ${selectedProductId} downloaded and is ready for analysis.` }));
-      if (response?.download?.success) {
+      if (response.provider === 'mock') {
+        setNotice('Synthetic fixture cached separately. It has no acquisition date or real-world coordinates and was not added to your analysis dataset.');
+      } else if (response?.download?.success) {
         setNotice(`Scene ${selectedProductId} downloaded and cached successfully.`);
+      } else {
+        setNotice(`Product ${selectedProductId} was not downloaded.`);
       }
     } catch (requestError) {
       setError(requestError.response?.data?.detail || 'Satellite product download failed.');
@@ -347,18 +523,26 @@ function App() {
   const datasetAvailable = Boolean(dataset?.current?.available);
 
   const handleDemoMode = useCallback(async () => {
-    setIsDemoMode(true);
-    setNotice('Demo mode enabled. Using the local dataset workflow without external dependencies.');
-    setDataSource('local');
+    setDemoLoading(true);
+    setError('');
+    setNotice('');
     try {
-      await refreshDataset();
-    } catch {
-      setError('Demo mode could not refresh the local dataset state.');
+      const response = await getGeoAIDemoScenario();
+      setDemoSummary(response);
+      setIsDemoMode(true);
+      setNotice('Synthetic demo loaded. These values are not satellite observations and are not saved as an analysis.');
+    } catch (requestError) {
+      setDemoSummary(null);
+      setIsDemoMode(false);
+      setError(friendlyError(requestError));
+    } finally {
+      setDemoLoading(false);
     }
-  }, [refreshDataset]);
+  }, []);
 
   const handleReset = useCallback(() => {
     setIsDemoMode(false);
+    setDemoSummary(null);
     setError('');
     setNotice('Workspace reset. The app is ready to start a fresh local analysis.');
     setAnalyses({});
@@ -368,6 +552,55 @@ function App() {
     setBusy('');
     setDataSource('local');
   }, []);
+
+  function handleAuthenticated(user) {
+    setAuthUser(user);
+    setAuthNotice('');
+    setAuthMode('ready');
+    setError('');
+  }
+
+  async function handleSignOut() {
+    setSigningOut(true);
+    try {
+      await signOut();
+      clearPrivateWorkspace();
+      setAuthUser(null);
+      setAuthNotice('');
+      setAuthMode(authRequired ? 'login' : 'ready');
+    } catch (signOutError) {
+      setError(signOutError.message || 'Unable to sign out.');
+    } finally {
+      setSigningOut(false);
+    }
+  }
+
+  if (authMode === 'checking') {
+    return <main className="auth-shell"><p role="status">Checking secure workspace access…</p></main>;
+  }
+  if (authMode === 'login' || authMode === 'configuration-error') {
+    return (
+      <AuthPanel
+        onAuthenticated={handleAuthenticated}
+        configurationError={authMode === 'configuration-error'}
+        sessionNotice={authNotice}
+      />
+    );
+  }
+  if (authMode === 'unavailable') {
+    return (
+      <main className="auth-shell">
+        <div className="auth-card">
+          <p className="eyebrow">WORKSPACE UNAVAILABLE</p>
+          <h1>Unable to verify access</h1>
+          <p>{backendError || 'The backend could not verify authentication status.'}</p>
+          <button className="secondary-button" type="button" onClick={() => window.location.reload()}>
+            Try again
+          </button>
+        </div>
+      </main>
+    );
+  }
 
   return (
     <div className="app-shell">
@@ -386,15 +619,49 @@ function App() {
       </aside>
 
       <main id="top" className="main-content">
-        <Header backendStatus={backendStatus} />
+        <Header
+          backendStatus={backendStatus}
+          userEmail={authUser?.email}
+          onSignOut={authUser ? handleSignOut : null}
+          signingOut={signingOut}
+        />
         <section id="overview" className="page-heading">
-          <div><p className="eyebrow">EARTH OBSERVATION / ANALYSIS</p><h1>Satellite Intelligence</h1><p>AI-assisted analysis of pre-downloaded satellite imagery.</p></div>
+          <div><p className="eyebrow">EARTH OBSERVATION / ANALYSIS</p><h1>Satellite Intelligence</h1><p>Spectral indices and a transparent land-cover baseline from GeoTIFF inputs.</p></div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-            <button type="button" className="secondary-button" onClick={handleDemoMode}>Demo mode</button>
+            <button type="button" className="secondary-button" onClick={handleDemoMode} disabled={demoLoading || backendStatus !== 'online'}>
+              {demoLoading ? 'Loading demo…' : isDemoMode ? 'Refresh demo' : 'Demo mode'}
+            </button>
             <button type="button" className="secondary-button" onClick={handleReset}>Reset</button>
             {resultLoading && <LoadingIndicator label="Loading saved result" />}
           </div>
         </section>
+
+        {demoLoading && <div className="alert info" role="status">Loading deterministic synthetic demo…</div>}
+        {demoSummary && (
+          <section className="panel" aria-label="Synthetic demo scenario">
+            <div className="panel-header">
+              <div><p className="eyebrow">SYNTHETIC DEMONSTRATION ONLY</p><h2>Index calculation example</h2></div>
+              <span className="stage-badge">NOT SATELLITE DATA</span>
+            </div>
+            <p>{demoSummary.message}</p>
+            <div className="ndvi-stat-grid">
+              {['ndvi', 'ndwi', 'ndbi'].map((key) => (
+                <div className="ndvi-stat" key={key}>
+                  <small>{key.toUpperCase()} mean</small>
+                  <b>{number(demoSummary.results?.[key]?.statistics?.mean)}</b>
+                </div>
+              ))}
+              <div className="ndvi-stat">
+                <small>Land-cover baseline</small>
+                <b>{Object.values(demoSummary.results?.landcover?.class_distribution ?? {}).length} rule classes</b>
+              </div>
+            </div>
+            <p className="panel-note">
+              This in-memory fixture is not saved, has no acquisition date or geographic coordinates,
+              and cannot be confused with a user upload or live observation.
+            </p>
+          </section>
+        )}
 
         {backendStatus === 'offline' && <ErrorMessage message={backendError} />}
         {error && backendStatus !== 'offline' && <ErrorMessage message={error} onDismiss={() => setError('')} />}
@@ -426,23 +693,23 @@ function App() {
                 <form onSubmit={handleSatelliteSearch} style={{ display: 'grid', gap: 10 }}>
                   <label style={{ display: 'grid', gap: 6 }}>
                     <span style={{ fontSize: 11, color: '#9aaea3' }}>AOI GeoJSON</span>
-                    <textarea value={JSON.stringify(aoi, null, 2)} onChange={(event) => { try { setAoi(JSON.parse(event.target.value)); } catch { setAoi((previous) => previous); } }} rows={6} style={{ width: '100%', background: '#121d20', color: '#edf5f2', border: '1px solid #2b3a3c', borderRadius: 6, padding: 10 }} />
+                    <textarea value={aoiText} onChange={(event) => { setAoiText(event.target.value); setAoi(null); setSelectedProductId(''); setSatelliteResults([]); }} rows={6} placeholder='{"type":"Polygon","coordinates":[...]}' style={{ width: '100%', background: '#121d20', color: '#edf5f2', border: '1px solid #2b3a3c', borderRadius: 6, padding: 10 }} />
                   </label>
                   <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 8 }}>
                     <label style={{ display: 'grid', gap: 6 }}>
                       <span style={{ fontSize: 11, color: '#9aaea3' }}>Start date</span>
-                      <input type="date" value={searchWindow.startDate} onChange={(event) => setSearchWindow((previous) => ({ ...previous, startDate: event.target.value }))} style={{ background: '#121d20', color: '#edf5f2', border: '1px solid #2b3a3c', borderRadius: 6, padding: 8 }} />
+                      <input type="date" required value={searchWindow.startDate} onChange={(event) => { setSearchWindow((previous) => ({ ...previous, startDate: event.target.value })); setSelectedProductId(''); setSatelliteResults([]); }} style={{ background: '#121d20', color: '#edf5f2', border: '1px solid #2b3a3c', borderRadius: 6, padding: 8 }} />
                     </label>
                     <label style={{ display: 'grid', gap: 6 }}>
                       <span style={{ fontSize: 11, color: '#9aaea3' }}>End date</span>
-                      <input type="date" value={searchWindow.endDate} onChange={(event) => setSearchWindow((previous) => ({ ...previous, endDate: event.target.value }))} style={{ background: '#121d20', color: '#edf5f2', border: '1px solid #2b3a3c', borderRadius: 6, padding: 8 }} />
+                      <input type="date" required value={searchWindow.endDate} onChange={(event) => { setSearchWindow((previous) => ({ ...previous, endDate: event.target.value })); setSelectedProductId(''); setSatelliteResults([]); }} style={{ background: '#121d20', color: '#edf5f2', border: '1px solid #2b3a3c', borderRadius: 6, padding: 8 }} />
                     </label>
                   </div>
                   <label style={{ display: 'grid', gap: 6 }}>
                     <span style={{ fontSize: 11, color: '#9aaea3' }}>Maximum cloud cover ({searchWindow.maxCloudCover}%)</span>
                     <input type="range" min="0" max="100" value={searchWindow.maxCloudCover} onChange={(event) => setSearchWindow((previous) => ({ ...previous, maxCloudCover: Number(event.target.value) }))} />
                   </label>
-                  <button className="primary-button" type="submit" disabled={liveLoading || !satelliteStatus.configured}>
+                  <button className="primary-button" type="submit" disabled={liveLoading || !satelliteStatus.configured || satelliteStatus.available === false}>
                     {liveLoading ? 'Searching…' : 'SEARCH SATELLITE DATA'}
                   </button>
                 </form>
@@ -452,15 +719,27 @@ function App() {
                     {satelliteResults.map((product) => (
                       <div key={product.product_id} style={{ display: 'flex', justifyContent: 'space-between', gap: 8, padding: 10, border: '1px solid #2b3a3c', borderRadius: 6, background: '#172124' }}>
                         <div>
-                          <div style={{ fontWeight: 700 }}>{product.acquisition_date}</div>
-                          <small style={{ color: '#8fa0a0' }}>{product.cloud_cover ?? 'N/A'}% cloud · {product.platform}</small>
+                          <div style={{ fontWeight: 700 }}>
+                            {product.metadata?.data_classification === 'synthetic'
+                              ? 'Synthetic fixture · no acquisition date'
+                              : product.acquisition_date ?? 'Acquisition date unavailable'}
+                          </div>
+                          <small style={{ color: '#8fa0a0' }}>
+                            {product.metadata?.data_classification === 'synthetic'
+                              ? 'Not an observation · no cloud or geographic metadata'
+                              : `${product.cloud_cover ?? 'N/A'}% cloud · ${product.platform}`}
+                          </small>
                           <div style={{ color: '#b7c7c4', fontSize: 11 }}>{product.product_id}</div>
                         </div>
                         <button type="button" className="secondary-button" onClick={() => setSelectedProductId(product.product_id)}>{selectedProductId === product.product_id ? 'Selected' : 'Select'}</button>
                       </div>
                     ))}
                     {selectedProductId && (
-                      <button type="button" className="primary-button" onClick={handleSatelliteDownload} disabled={liveLoading}>USE THIS SCENE</button>
+                      <button type="button" className="primary-button" onClick={handleSatelliteDownload} disabled={liveLoading}>
+                        {satelliteResults.find((product) => product.product_id === selectedProductId)?.metadata?.data_classification === 'synthetic'
+                          ? 'CACHE SYNTHETIC FIXTURE'
+                          : 'USE THIS SCENE'}
+                      </button>
                     )}
                   </div>
                 )}
@@ -483,7 +762,22 @@ function App() {
             </div>
           </div>
           {busy && <div className="map-loading"><LoadingIndicator label="Processing satellite raster…" /></div>}
-          <MapView result={selected} layerName={mapLayer?.label} resultId={resultId} />
+          {selected ? (
+            <Suspense fallback={<div className="map-loading" role="status">Loading map module…</div>}>
+              <MapView
+                result={selected}
+                layerName={mapLayer?.label}
+                resultId={resultId}
+                layerKey={activeLayer}
+              />
+            </Suspense>
+          ) : (
+            <div className="map-empty">
+              <div className="map-crosshair">◎</div>
+              <b>Georeferenced results will appear here</b>
+              <span>No map location is assumed. Load valid rasters and run an analysis.</span>
+            </div>
+          )}
           <div className="map-footer"><Legend layer={activeLayer} /><span>{selected?.statistics?.valid_pixels?.toLocaleString() ?? '--'} valid pixels</span></div>
         </section>
 
@@ -498,6 +792,36 @@ function App() {
           <MetricCard title="Water-related share" icon="≈" value={percent(ndwi?.water_related_percentage)} subtitle="NDWI threshold indicator" />
           <MetricCard title="Built-up indicator" icon="⌂" value={percent(ndbi?.built_up_indicator_percentage)} subtitle="Not definitive building detection" />
           <MetricCard title="Mean NDVI change" icon="Δ" value={number(change?.mean_change)} subtitle={change ? `Changed pixels ${percent(change.changed_pixel_percentage)}` : 'Historical data required'} />
+        </section>
+
+        <section className="panel" aria-label="Analysis data provenance">
+          <div className="panel-header">
+            <div><p className="eyebrow">INPUT PROVENANCE</p><h2>Source and data quality</h2></div>
+          </div>
+          {Object.keys(selectedProvenance).length ? (
+            <div className="content-grid">
+              {Object.entries(selectedProvenance).map(([datasetId, provenance]) => (
+                <div className="ndvi-stat" key={datasetId}>
+                  <strong>{datasetId} · {provenance.data_classification?.replaceAll('_', ' ')}</strong>
+                  <div>Source: {provenance.source ?? 'unknown'}</div>
+                  <div>Platform / sensor: {provenance.platform ?? 'unverified'} / {provenance.sensor ?? 'unverified'}</div>
+                  <div>Acquisition: {provenance.acquisition_date ?? 'not recorded'}</div>
+                  <div>CRS: {provenance.crs ?? 'unknown'} · Cloud cover: {provenance.cloud_cover_percentage ?? 'unknown'}</div>
+                  <div>
+                    Resolution:{' '}
+                    {Object.values(provenance.bands ?? {})[0]?.resolution?.join(' × ') ?? 'unknown'}
+                    {' '}{Object.values(provenance.bands ?? {})[0]?.resolution_units ?? ''}
+                  </div>
+                  {provenance.quality_warnings?.length > 0 && (
+                    <ul>{provenance.quality_warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul>
+                  )}
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="chart-empty">Run or select a saved analysis to view provenance recorded from its input rasters.</div>
+          )}
+          <p className="panel-note">Band names do not verify sensor identity, calibration, atmospheric correction, or cloud masking.</p>
         </section>
 
         <section className="panel" aria-label="Predictive GeoAI dashboard">
@@ -518,7 +842,18 @@ function App() {
                   <div className="ndvi-stat"><small>Interval support</small><b>{geoAIInsights.forecast?.prediction_interval?.support ? 'Yes' : 'Limited'}</b></div>
                 </div>
               ) : (
-                <div className="chart-empty">Forecast requires at least two viable historical NDVI observations.</div>
+                <div className="chart-empty">
+                  {geoAIInsights.forecast?.message ?? 'Forecast requires at least two distinct, dated NDVI observations.'}
+                  {geoAIInsights.forecast?.observation_warnings?.length > 0
+                    && <ul>{geoAIInsights.forecast.observation_warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul>}
+                </div>
+              )}
+              {geoAIInsights.forecast?.success && (
+                <p className="panel-note">
+                  Input classification: {geoAIInsights.forecast.data_classification?.replaceAll('_', ' ') ?? 'unknown'}.
+                  {geoAIInsights.forecast.observation_warnings?.length > 0
+                    && ` ${geoAIInsights.forecast.observation_warnings.join(' ')}`}
+                </p>
               )}
               <p className="panel-note">{geoAIInsights.forecast?.limitations ?? 'No forecast generated yet.'}</p>
             </div>
@@ -533,19 +868,34 @@ function App() {
                   <div className="ndvi-stat"><small>Period</small><b>{geoAIInsights.history?.start_date ?? '--'} → {geoAIInsights.history?.end_date ?? '--'}</b></div>
                 </div>
               ) : (
-                <div className="chart-empty">Historic observations are unavailable or insufficient for analysis.</div>
+                <div className="chart-empty">
+                  {geoAIInsights.history?.message ?? 'Historic observations are unavailable or insufficient for analysis.'}
+                  {geoAIInsights.history?.observation_warnings?.length > 0
+                    && <ul>{geoAIInsights.history.observation_warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul>}
+                </div>
+              )}
+              {geoAIInsights.history?.success && (
+                <p className="panel-note">
+                  Input classification: {geoAIInsights.history.data_classification?.replaceAll('_', ' ') ?? 'unknown'}.
+                </p>
               )}
             </div>
 
             <div className="panel chart-panel">
               <div className="panel-header"><div><p className="eyebrow">TRANSITIONS</p><h2>Land-cover change</h2></div></div>
               {geoAIInsights.transitions?.success ? (
-                <div className="ndvi-stat-grid">
+                <>
+                  <div className="ndvi-stat-grid">
                   <div className="ndvi-stat"><small>Valid pixels</small><b>{geoAIInsights.transitions?.valid_pixel_count?.toLocaleString() ?? '--'}</b></div>
                   <div className="ndvi-stat"><small>Transitions</small><b>{geoAIInsights.transitions?.transitions?.length ?? 0}</b></div>
                   <div className="ndvi-stat"><small>Largest shift</small><b>{geoAIInsights.transitions?.transitions?.[0]?.pixel_count ?? 0}</b></div>
                   <div className="ndvi-stat"><small>Source</small><b>{geoAIInsights.transitions?.transitions?.[0]?.source_label ?? 'n/a'}</b></div>
-                </div>
+                  </div>
+                  <p className="panel-note">
+                    One historical-to-current raster pair; differences are not a repeated trend.
+                    {' '}Classification: {geoAIInsights.transitions?.provenance?.data_classification?.replaceAll('_', ' ') ?? 'unverified inputs'}.
+                  </p>
+                </>
               ) : (
                 <div className="chart-empty">Land-cover transitions are unavailable without aligned historical and current rasters.</div>
               )}
@@ -554,14 +904,39 @@ function App() {
             <div className="panel chart-panel">
               <div className="panel-header"><div><p className="eyebrow">RISK</p><h2>Indicator summary</h2></div></div>
               {geoAIInsights.risk?.success ? (
-                <div className="ndvi-stat-grid">
-                  <div className="ndvi-stat"><small>Indicators</small><b>{geoAIInsights.risk?.count ?? 0}</b></div>
-                  <div className="ndvi-stat"><small>Highest severity</small><b>{geoAIInsights.risk?.indicators?.[0]?.severity ?? 'n/a'}</b></div>
-                  <div className="ndvi-stat"><small>Focus</small><b>{geoAIInsights.risk?.indicators?.[0]?.indicator_name ?? 'n/a'}</b></div>
-                  <div className="ndvi-stat"><small>Confidence</small><b>{geoAIInsights.risk?.indicators?.[0]?.data_quality?.status ?? 'n/a'}</b></div>
-                </div>
+                <>
+                  <div className="ndvi-stat-grid">
+                  <div className="ndvi-stat"><small>Screening indicators</small><b>{geoAIInsights.risk?.count ?? 0}</b></div>
+                  <div className="ndvi-stat"><small>Risk score</small><b>Not calibrated</b></div>
+                  <div className="ndvi-stat"><small>Evidence</small><b>{geoAIInsights.risk?.indicators?.[0]?.indicator_name ?? 'No configured threshold triggered'}</b></div>
+                  <div className="ndvi-stat"><small>Input quality</small><b>{geoAIInsights.risk?.indicators?.[0]?.data_quality?.status ?? 'See provenance'}</b></div>
+                  </div>
+                  <p className="panel-note">
+                    Input classification: {geoAIInsights.risk.data_classification?.replaceAll('_', ' ') ?? 'unknown'}.
+                    {' '}Threshold screening only; no calibrated risk score or causal explanation is produced.
+                  </p>
+                </>
               ) : (
-                <div className="chart-empty">No actionable risk indicators are available yet.</div>
+                <div className="chart-empty">{geoAIInsights.risk?.message ?? 'Risk screening is unavailable without valid current raster inputs.'}</div>
+              )}
+            </div>
+
+            <div className="panel chart-panel">
+              <div className="panel-header"><div><p className="eyebrow">EVALUATION</p><h2>Forecast baseline hold-out</h2></div></div>
+              {geoAIInsights.evaluation?.success ? (
+                <>
+                  <div className="ndvi-stat-grid">
+                    <div className="ndvi-stat"><small>MAE</small><b>{number(geoAIInsights.evaluation.metrics?.mae)}</b></div>
+                    <div className="ndvi-stat"><small>RMSE</small><b>{number(geoAIInsights.evaluation.metrics?.rmse)}</b></div>
+                    <div className="ndvi-stat"><small>Persistence MAE</small><b>{number(geoAIInsights.evaluation.metrics?.baseline_mae)}</b></div>
+                    <div className="ndvi-stat"><small>Test observations</small><b>{geoAIInsights.evaluation.test_observation_count ?? '--'}</b></div>
+                  </div>
+                  <p className="panel-note">{geoAIInsights.evaluation.limitations}</p>
+                </>
+              ) : (
+                <div className="chart-empty">
+                  {geoAIInsights.evaluation?.message ?? 'Evaluation is unavailable until enough distinct, metadata-dated observations exist.'}
+                </div>
               )}
             </div>
           </div>
@@ -583,8 +958,28 @@ function App() {
             </div> : <div className="chart-empty">NDVI statistics will appear after calculating B04 and B08.</div>}
             <p className="panel-note">Index ranges are contextual indicators, not universal crop-health categories.</p>
           </div>
-          <LandCoverChart result={landcover} />
-          <ChangeChart result={change} currentResult={current} />
+          {landcover ? (
+            <Suspense fallback={<div className="panel chart-panel chart-empty" role="status">Loading land-cover chart…</div>}>
+              <LandCoverChart result={landcover} />
+            </Suspense>
+          ) : (
+            <article id="landcover" className="panel chart-panel">
+              <div className="panel-header"><div><p className="eyebrow">BASELINE CLASSIFICATION</p><h2>Land-cover distribution</h2></div><span className="method-badge">HEURISTIC</span></div>
+              <div className="chart-empty">Land-cover values appear here after a successful classification.</div>
+              <p className="panel-note">Transparent index-threshold baseline; not a trained model or ground truth.</p>
+            </article>
+          )}
+          {change ? (
+            <Suspense fallback={<div className="panel chart-panel chart-empty" role="status">Loading vegetation-change chart…</div>}>
+              <ChangeChart result={change} currentResult={current} />
+            </Suspense>
+          ) : (
+            <article id="change" className="panel chart-panel">
+              <div className="panel-header"><div><p className="eyebrow">TEMPORAL COMPARISON</p><h2>Vegetation change</h2></div><span className="method-badge">HISTORICAL DATA NEEDED</span></div>
+              <div className="chart-empty">Aligned historical B04 and B08 imagery is required to compare periods.</div>
+              <p className="panel-note">Change = current NDVI − historical NDVI. Not a causal assessment.</p>
+            </article>
+          )}
           <InsightPanel messages={insights} />
         </section>
 
@@ -592,13 +987,31 @@ function App() {
           <section className="panel downloads-panel">
             <div className="panel-header">
               <div><p className="eyebrow">SAVED OUTPUTS</p><h2>Recent results</h2></div>
-              <select className="result-select" aria-label="Load saved result" onChange={handleSelectResult} value="">
-                <option value="">Select a saved result</option>
-                {recentResults.map((item) => <option value={item.id} key={item.id}>{item.analysis} · {new Date(item.created_at).toLocaleString()}</option>)}
-              </select>
+              <div className="result-controls">
+                <select className="result-select" aria-label="Load saved result" onChange={handleSelectResult} value="">
+                  <option value="">Select a saved result</option>
+                  {recentResults.map((item) => <option value={item.id} key={item.id}>{item.analysis} · {new Date(item.created_at).toLocaleString()}</option>)}
+                </select>
+                {nextResultsOffset !== null && (
+                  <button
+                    className="secondary-button"
+                    type="button"
+                    onClick={loadOlderResults}
+                    disabled={loadingOlderResults}
+                  >
+                    {loadingOlderResults ? 'Loading…' : 'Load older results'}
+                  </button>
+                )}
+              </div>
             </div>
             {resultId && <p className="panel-note">Current result ID: <code>{resultId}</code></p>}
-            <DownloadPanel resultId={resultId} analyses={analyses} onError={setError} />
+            <DownloadPanel
+              resultId={resultId}
+              artifacts={resultArtifacts}
+              loading={artifactsLoading}
+              error={artifactsError}
+              onError={setError}
+            />
           </section>
           <article className="panel about-panel" id="about">
             <div className="panel-header"><div><p className="eyebrow">METHOD</p><h2>How to interpret results</h2></div></div>
